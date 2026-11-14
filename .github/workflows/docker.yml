@@ -87,7 +87,9 @@ jobs:
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          # The image is the backend's, whatever the repository is called; infra and its
+          # release script pull this name.
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/spacegame-backend
           flavor: latest=false
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
