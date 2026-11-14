@@ -26,7 +26,7 @@ after pool reuse. Check formation spacing and where the laser stops on the boss.
 
 ## Persistent leaderboard
 
-The game uses [spacegame-backend](https://github.com/gitlost808/spacegame-backend)
+The game uses the [backend](../README.md) in this repository
 for shared scores. Before each run, choose a pilot name (1–32 characters); the
 browser remembers it for next time. A session is created before gameplay starts,
 the running score is checkpointed every 10 seconds (also while paused), and game
@@ -43,27 +43,33 @@ the backend and keeps the personal high score on this device.
 
 ### Local setup
 
-1. Follow the backend's README to start PostgreSQL, apply migrations, and run the
-   API (port 8080 by default).
-2. Set `leaderboardApiUrl` in `src/game/constants.ts` to the backend base URL,
-   without `/api/v1` (for example, `http://localhost:8080`).
+Run these commands in `web/`; Node.js 24 and npm are required.
+
+1. Follow the [backend README](../README.md) to start PostgreSQL, apply
+   migrations, and run the API (port 8080 by default).
+2. Set `leaderboardApiUrl` in `src/constants.ts` to the backend base URL,
+   without `/api/v1` (for example, `http://localhost:8080`). Don't commit it.
 3. Set the backend's `CORS_ALLOWED_ORIGINS` to the exact frontend origin. Parcel
    uses `http://localhost:1234` by default; the backend example uses port 5173,
    so update it for this project. Restart the backend after changing it.
-4. Run `npm start` and open `/game/`.
+4. Run `npm ci`, then `npm start`, and open `/`.
+
+`npm run typecheck` and `npm test` run the checks that CI runs.
 
 ### Hosting
 
-`leaderboardApiUrl` in `src/game/constants.ts` is set to
-`https://spacegame.0x29a.me`. Build and deploy the repository as usual. The URL is
-part of the source; no frontend environment configuration is required. Allow
-the frontend's HTTPS origin in the backend's CORS configuration. Rebuild after
-changing the constant.
+`leaderboardApiUrl` is empty, so requests use `/api/v1` on the game's own
+origin and need no CORS. The host serves the built files and forwards `/api/`
+to the backend. Static hosting alone does not provide persistence; the backend
+and its PostgreSQL database must be running. The PWA does not cache API
+requests.
 
-With `leaderboardApiUrl: ''`, requests use `/api/v1` on the current origin.
-Configure your reverse proxy to forward that path to the backend. Static hosting
-alone does not provide persistence; the backend and its PostgreSQL database must
-be running. The PWA does not cache API requests.
+The repository's root `deploy.sh` builds this directory into an empty staging
+directory for the 0x29a.me static-site publisher. Production pins the frontend
+and the backend image to the same commit and releases both with one
+infrastructure change, so a push to `main` alone deploys neither. The two still
+restart a few seconds apart, so keep API changes additive: a new client must
+tolerate the previous backend for that moment.
 
 The backend ranks individual runs; a pilot name can occur more than once. Names
 are display names, not authenticated accounts.
@@ -118,7 +124,7 @@ MAX_SCORE_PER_SECOND=300
 ```
 
 The backend defaults to 1000 points per second; 300 is a tighter suggested
-ceiling, not a change to the backend repository. It is a whole-run average, not
+ceiling, not a change to the backend's default. It is a whole-run average, not
 a limit on the points awarded during any single second. Boss kills and bombs
 can award many points at once.
 
@@ -152,6 +158,6 @@ simply accepting a client-supplied duration does not make it authoritative.
 
 ### Checks
 
-Run `npm run typecheck`, `npm run test:leaderboard`, and `npm run build`. The API
+Run `npm run typecheck`, `npm test`, and `npm run build`. The API
 client tests use Node's built-in test runner and TypeScript support (Node 22.18+
 or 24+). They mock HTTP responses, so a running backend is not required.

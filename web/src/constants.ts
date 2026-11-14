@@ -1,7 +1,7 @@
 export const constants = {
-  // Backend base URL, without /api/v1. Empty uses the game's origin.
-  // Set to http://localhost:8080 for local development or your deployed HTTPS URL.
-  leaderboardApiUrl: 'https://spacegame.0x29a.me',
+  // Backend base URL, without /api/v1. Empty uses the game's origin, which serves the API in
+  // production. Set to http://localhost:8080 for local development.
+  leaderboardApiUrl: '',
   // the playfield: a fixed size, scaled to fit the window, so the game plays the same on every screen
   width: 540,
   height: 960,

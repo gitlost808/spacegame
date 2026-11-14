@@ -1,3 +1,24 @@
+// Kode Mono is licensed under the SIL Open Font License 1.1; see ../fonts/OFL.txt.
+@font-face {
+  font-family: "Kode Mono";
+  font-style: normal;
+  font-weight: 400;
+  src: url("../fonts/KodeMono-Regular.ttf") format("truetype");
+  font-display: swap;
+}
+
+body {
+  font-family: "Kode Mono", monospace;
+  background: #060606;
+  color: #859900;
+  overflow: hidden;
+  margin: 0;
+
+  ::selection {
+    background: #666;
+  }
+}
+
 canvas {
   touch-action: none;
 }

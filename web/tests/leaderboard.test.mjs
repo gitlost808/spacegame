@@ -6,7 +6,7 @@ import {
   LeaderboardRun,
   PlayerNameError,
   validatePlayerName,
-} from '../src/game/leaderboard/client.ts';
+} from '../src/leaderboard/client.ts';
 
 const session = {
   session_id: 'e75be306-fdb1-44d2-9dd7-e2d2beeb3e76',
