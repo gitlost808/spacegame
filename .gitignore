@@ -6,3 +6,6 @@
 !.env.example
 /secrets/
 /backups/
+/web/node_modules/
+/web/dist/
+/web/.parcel-cache/

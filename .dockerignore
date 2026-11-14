@@ -9,3 +9,5 @@ coverage.out
 *.test
 secrets
 backups
+web
+deploy.sh
