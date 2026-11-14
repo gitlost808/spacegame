@@ -6,6 +6,8 @@ A leaderboard service for a space shooter browser game, using
 development also requires Docker Compose. Database migrations use
 [Goose](https://github.com/pressly/goose), pinned in `go.mod`.
 
+The game itself, a Phaser frontend, lives in [`web/`](web/README.md).
+
 ## Run
 
 ```sh
@@ -305,6 +307,8 @@ migrations/        Versioned SQL schema changes and authoring instructions
 docs/container.md  Runtime contract for the separate infrastructure repository
 Dockerfile         Server and migration binaries in a non-root runtime image
 compose.yaml       Local app and PostgreSQL service with persistent storage
+web/               Game frontend (Phaser, Parcel), tests, and its font
+deploy.sh          Static-site build entry point for the frontend
 ```
 
 Register new endpoints in `internal/httpapi/router.go`. Add application packages

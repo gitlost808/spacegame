@@ -1,0 +1,25 @@
+{
+  "name": "spacegame-web",
+  "private": true,
+  "devDependencies": {
+    "@parcel/packager-raw-url": "^2.15.4",
+    "@parcel/service-worker": "^2.15.4",
+    "@parcel/transformer-pug": "^2.15.4",
+    "@parcel/transformer-sass": "^2.15.4",
+    "@parcel/transformer-webmanifest": "^2.15.4",
+    "buffer": "^6.0.3",
+    "parcel": "^2.15.4",
+    "phaser": "^4.2.1",
+    "prettier": "^3.9.10",
+    "process": "^0.11.10",
+    "typescript": "^7.0.2"
+  },
+  "scripts": {
+    "start": "parcel",
+    "clean": "rm -rf dist .parcel-cache",
+    "build": "parcel build",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.worker.json",
+    "test": "node --test tests/leaderboard.test.mjs"
+  },
+  "source": "src/index.pug"
+}
