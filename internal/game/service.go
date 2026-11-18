@@ -35,6 +35,7 @@ var (
 // Rejection reasons wrap ErrRunRejected for logs and tests. Clients only see
 // ErrRunRejected so responses do not reveal which plausibility limit failed.
 var (
+	errStateChanged     = errors.New("session changed concurrently")
 	errExpired          = errors.New("session has expired")
 	errTooShort         = errors.New("session duration is below the minimum")
 	errInvalidScore     = errors.New("score progress is not plausible")
@@ -106,9 +107,35 @@ func (s *Service) Start(ctx context.Context, name string) (StartedSession, error
 	}, nil
 }
 
-// Checkpoint records the run's current total score. Runs must report progress
-// at least every MaxCheckpointGap, so an idle session cannot claim a score later.
+// Checkpoint records progress while playing. Paused runs keep their frozen score
+// and need no heartbeats; only an authenticated resume restarts the score clock.
 func (s *Service) Checkpoint(ctx context.Context, id, token string, score int64) error {
+	return s.progress(ctx, id, token, score, nil)
+}
+
+func (s *Service) Pause(ctx context.Context, id, token string, score int64) error {
+	paused := true
+	return s.progress(ctx, id, token, score, &paused)
+}
+
+func (s *Service) Resume(ctx context.Context, id, token string, score int64) error {
+	paused := false
+	return s.progress(ctx, id, token, score, &paused)
+}
+
+func (s *Service) progress(ctx context.Context, id, token string, score int64, paused *bool) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := s.progressOnce(ctx, id, token, score, paused)
+		if !errors.Is(err, errStateChanged) {
+			return err
+		}
+	}
+}
+
+func (s *Service) progressOnce(ctx context.Context, id, token string, score int64, paused *bool) error {
 	sessionID, session, hash, err := s.authenticate(ctx, id, token)
 	if err != nil {
 		return err
@@ -118,31 +145,52 @@ func (s *Service) Checkpoint(ctx context.Context, id, token string, score int64)
 	}
 	at := s.now().UTC().Truncate(time.Microsecond)
 	if reason := s.checkProgress(session, at, score); reason != nil {
-		if _, err := s.reject(ctx, sessionID, hash, reason); err != nil {
+		if _, err := s.reject(ctx, sessionID, hash, session.Revision, reason); err != nil {
 			return err
 		}
 		return ErrSessionFinished
 	}
+	// Repeated transitions are idempotent and must not move the score clock.
+	if paused != nil && *paused == session.Paused || paused == nil && session.Paused {
+		return nil
+	}
+	nextPaused := session.Paused
+	if paused != nil {
+		nextPaused = *paused
+	}
+	if at.Before(session.CheckpointAt) {
+		at = session.CheckpointAt
+	}
+	pausedUS := session.PausedUs
+	if session.Paused {
+		pausedUS += at.Sub(session.CheckpointAt).Microseconds()
+	}
 	recorded, err := s.queries.RecordCheckpoint(ctx, store.RecordCheckpointParams{
 		ID: sessionID, TokenHash: hash, CheckpointScore: score, CheckpointAt: at,
+		Paused: nextPaused, PausedUs: pausedUS, Revision: session.Revision,
 	})
 	if err != nil {
 		return fmt.Errorf("record checkpoint: %w", err)
 	}
 	if recorded == 0 {
-		// A concurrent finish, rejection, or newer checkpoint won the conditional update.
-		session, err := s.queries.GetSession(ctx, sessionID)
-		if err != nil {
-			return sessionError(err)
-		}
-		if session.FinishedAt.Valid {
-			return ErrSessionFinished
-		}
+		return errStateChanged
 	}
 	return nil
 }
 
 func (s *Service) Finish(ctx context.Context, id, token string, score int64) (Result, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+		result, err := s.finishOnce(ctx, id, token, score)
+		if !errors.Is(err, errStateChanged) {
+			return result, err
+		}
+	}
+}
+
+func (s *Service) finishOnce(ctx context.Context, id, token string, score int64) (Result, error) {
 	sessionID, session, hash, err := s.authenticate(ctx, id, token)
 	if err != nil {
 		return Result{}, err
@@ -152,18 +200,19 @@ func (s *Service) Finish(ctx context.Context, id, token string, score int64) (Re
 	}
 	finishedAt := s.now().UTC().Truncate(time.Microsecond)
 	reason := s.checkProgress(session, finishedAt, score)
-	if reason == nil && finishedAt.Sub(session.StartedAt) < s.policy.MinDuration {
+	if reason == nil && activeDuration(session, finishedAt) < s.policy.MinDuration {
 		reason = errTooShort
 	}
 	if reason != nil {
-		session, err := s.reject(ctx, sessionID, hash, reason)
+		session, err := s.reject(ctx, sessionID, hash, session.Revision, reason)
 		if err != nil {
 			return Result{}, err
 		}
 		return existingResult(session, score)
 	}
 	session, err = s.queries.FinishSession(ctx, store.FinishSessionParams{
-		ID: sessionID, TokenHash: hash,
+		ID: sessionID, TokenHash: hash, Revision: session.Revision,
+		PausedUs:   pausedMicroseconds(session, finishedAt),
 		Score:      pgtype.Int8{Int64: score, Valid: true},
 		FinishedAt: pgtype.Timestamptz{Time: finishedAt, Valid: true},
 	})
@@ -172,6 +221,9 @@ func (s *Service) Finish(ctx context.Context, id, token string, score int64) (Re
 		session, err = s.queries.GetSession(ctx, sessionID)
 		if err != nil {
 			return Result{}, sessionError(err)
+		}
+		if !session.FinishedAt.Valid {
+			return Result{}, errStateChanged
 		}
 		return existingResult(session, score)
 	}
@@ -204,6 +256,10 @@ func (s *Service) checkProgress(session store.GameSession, at time.Time, score i
 	switch {
 	case at.After(session.ExpiresAt):
 		return errExpired
+	case session.Paused && score != session.CheckpointScore:
+		return errInvalidScore
+	case session.Paused:
+		return nil
 	case since > s.policy.MaxCheckpointGap:
 		return errMissedCheckpoint
 	case score < session.CheckpointScore || float64(score-session.CheckpointScore) > float64(s.policy.MaxScorePerSecond)*since.Seconds():
@@ -214,9 +270,9 @@ func (s *Service) checkProgress(session store.GameSession, at time.Time, score i
 
 // reject deletes an unfinished run. If the run was already finished or deleted
 // concurrently, it returns the current state instead.
-func (s *Service) reject(ctx context.Context, id pgtype.UUID, tokenHash []byte, reason error) (store.GameSession, error) {
+func (s *Service) reject(ctx context.Context, id pgtype.UUID, tokenHash []byte, revision int64, reason error) (store.GameSession, error) {
 	deleted, err := s.queries.DeleteUnfinishedSession(ctx, store.DeleteUnfinishedSessionParams{
-		ID: id, TokenHash: tokenHash,
+		ID: id, TokenHash: tokenHash, Revision: revision,
 	})
 	if err != nil {
 		return store.GameSession{}, fmt.Errorf("delete rejected session: %w", err)
@@ -228,6 +284,9 @@ func (s *Service) reject(ctx context.Context, id pgtype.UUID, tokenHash []byte, 
 	session, err := s.queries.GetSession(ctx, id)
 	if err != nil {
 		return store.GameSession{}, sessionError(err)
+	}
+	if !session.FinishedAt.Valid {
+		return store.GameSession{}, errStateChanged
 	}
 	return session, nil
 }
@@ -245,7 +304,7 @@ func (s *Service) Leaderboard(ctx context.Context, limit int32) ([]Entry, error)
 		entries = append(entries, Entry{Rank: i + 1, Result: Result{
 			SessionID: row.ID.String(), PlayerName: row.PlayerName, Score: row.Score.Int64,
 			StartedAt: row.StartedAt, FinishedAt: row.FinishedAt.Time,
-			DurationMS: row.FinishedAt.Time.Sub(row.StartedAt).Milliseconds(),
+			DurationMS: (row.FinishedAt.Time.Sub(row.StartedAt) - time.Duration(row.PausedUs)*time.Microsecond).Milliseconds(),
 		}})
 	}
 	return entries, nil
@@ -262,7 +321,7 @@ func result(session store.GameSession) Result {
 	return Result{
 		SessionID: session.ID.String(), PlayerName: session.PlayerName, Score: session.Score.Int64,
 		StartedAt: session.StartedAt, FinishedAt: session.FinishedAt.Time,
-		DurationMS: session.FinishedAt.Time.Sub(session.StartedAt).Milliseconds(),
+		DurationMS: activeDuration(session, session.FinishedAt.Time).Milliseconds(),
 	}
 }
 
@@ -271,4 +330,18 @@ func sessionError(err error) error {
 		return ErrNotFound
 	}
 	return fmt.Errorf("load session: %w", err)
+}
+
+// All timing is server-recorded. The checkpoint timestamp marks the start of a
+// current pause; completed pauses are accumulated separately.
+func pausedMicroseconds(session store.GameSession, at time.Time) int64 {
+	us := session.PausedUs
+	if session.Paused {
+		us += max(at.Sub(session.CheckpointAt).Microseconds(), 0)
+	}
+	return us
+}
+
+func activeDuration(session store.GameSession, at time.Time) time.Duration {
+	return at.Sub(session.StartedAt) - time.Duration(pausedMicroseconds(session, at))*time.Microsecond
 }

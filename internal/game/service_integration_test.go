@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -54,6 +55,45 @@ func (s gatedFinishStore) DeleteUnfinishedSession(ctx context.Context, p store.D
 		}
 	}
 	return s.Querier.DeleteUnfinishedSession(ctx, p)
+}
+
+// Block only the first selected write so the losing request can revalidate.
+type gatedOnceWriteStore struct {
+	store.Querier
+	entered, resume chan struct{}
+	once            sync.Once
+	checkpoint      bool
+}
+
+func (s *gatedOnceWriteStore) wait(ctx context.Context) error {
+	var err error
+	s.once.Do(func() {
+		close(s.entered)
+		select {
+		case <-s.resume:
+		case <-ctx.Done():
+			err = ctx.Err()
+		}
+	})
+	return err
+}
+
+func (s *gatedOnceWriteStore) FinishSession(ctx context.Context, p store.FinishSessionParams) (store.GameSession, error) {
+	if !s.checkpoint {
+		if err := s.wait(ctx); err != nil {
+			return store.GameSession{}, err
+		}
+	}
+	return s.Querier.FinishSession(ctx, p)
+}
+
+func (s *gatedOnceWriteStore) RecordCheckpoint(ctx context.Context, p store.RecordCheckpointParams) (int64, error) {
+	if s.checkpoint {
+		if err := s.wait(ctx); err != nil {
+			return 0, err
+		}
+	}
+	return s.Querier.RecordCheckpoint(ctx, p)
 }
 
 func TestPostgresGameSessions(t *testing.T) {
@@ -331,6 +371,215 @@ func TestPostgresGameSessions(t *testing.T) {
 			t.Fatalf("a rejected run must be deleted: %v", err)
 		}
 	})
+	t.Run("persisted_pause_and_conditional_writes", func(t *testing.T) {
+		now = start
+		run, err := service.Start(ctx, "Paused")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var id pgtype.UUID
+		_ = id.Scan(run.SessionID)
+		before, err := queries.GetSession(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		now = start.Add(10 * time.Second)
+		if err := service.Pause(ctx, run.SessionID, run.SessionToken, 5000); err != nil {
+			t.Fatal(err)
+		}
+		// These were validated before pause. None may overwrite or delete its state.
+		if n, err := queries.RecordCheckpoint(ctx, store.RecordCheckpointParams{
+			ID: id, TokenHash: before.TokenHash, Revision: before.Revision,
+			CheckpointAt: now, CheckpointScore: 10000,
+		}); err != nil || n != 0 {
+			t.Fatalf("stale checkpoint: n=%d error=%v", n, err)
+		}
+		if _, err := queries.FinishSession(ctx, store.FinishSessionParams{
+			ID: id, TokenHash: before.TokenHash, Revision: before.Revision,
+			Score: pgtype.Int8{Int64: 10000, Valid: true}, FinishedAt: pgtype.Timestamptz{Time: now, Valid: true},
+		}); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("stale finish: %v", err)
+		}
+		if n, err := queries.DeleteUnfinishedSession(ctx, store.DeleteUnfinishedSessionParams{
+			ID: id, TokenHash: before.TokenHash, Revision: before.Revision,
+		}); err != nil || n != 0 {
+			t.Fatalf("stale rejection: n=%d error=%v", n, err)
+		}
+		reloaded, _ := NewService(queries, DefaultPolicy())
+		reloaded.now = func() time.Time { return now }
+		now = start.Add(10 * time.Minute)
+		if err := reloaded.Checkpoint(ctx, run.SessionID, run.SessionToken, 5000); err != nil {
+			t.Fatal(err)
+		}
+		if err := reloaded.Pause(ctx, run.SessionID, run.SessionToken, 5000); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 2; i++ {
+			if err := reloaded.Resume(ctx, run.SessionID, run.SessionToken, 5000); err != nil {
+				t.Fatal(err)
+			}
+		}
+		now = now.Add(2 * time.Second)
+		finished, err := reloaded.Finish(ctx, run.SessionID, run.SessionToken, 7000)
+		if err != nil || finished.DurationMS != 12000 {
+			t.Fatalf("finish=%+v error=%v", finished, err)
+		}
+		entries, err := reloaded.Leaderboard(ctx, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, entry := range entries {
+			if entry.SessionID == run.SessionID {
+				found = true
+				if entry.DurationMS != finished.DurationMS {
+					t.Fatalf("leaderboard duration=%d", entry.DurationMS)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("paused run missing from leaderboard")
+		}
+	})
+	t.Run("finish_revalidates_after_concurrent_pause_and_resume", func(t *testing.T) {
+		now = start
+		run, err := service.Start(ctx, "Racing pause")
+		if err != nil {
+			t.Fatal(err)
+		}
+		gate := &gatedOnceWriteStore{Querier: queries, entered: make(chan struct{}), resume: make(chan struct{})}
+		stale, _ := NewService(gate, DefaultPolicy())
+		stale.now = func() time.Time { return now }
+		now = start.Add(10 * time.Second)
+		done := make(chan error, 1)
+		go func() { _, err := stale.Finish(ctx, run.SessionID, run.SessionToken, 10000); done <- err }()
+		select {
+		case <-gate.entered:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		var once sync.Once
+		release := func() { once.Do(func() { close(gate.resume) }) }
+		defer release()
+		if err := service.Pause(ctx, run.SessionID, run.SessionToken, 0); err != nil {
+			t.Fatal(err)
+		}
+		now = start.Add(10 * time.Minute)
+		if err := service.Resume(ctx, run.SessionID, run.SessionToken, 0); err != nil {
+			t.Fatal(err)
+		}
+		release()
+		select {
+		case err := <-done:
+			// The gate forces pause/resume to win before the finish retries. Its
+			// rejection wraps both the public sentinel and the private score reason.
+			if !errors.Is(err, errInvalidScore) || !errors.Is(err, ErrRunRejected) {
+				t.Fatalf("stale finish accepted: %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	})
+	for _, tt := range []struct {
+		name        string
+		finishFirst bool
+		pauseScore  int64
+	}{
+		{"finish_wins", true, 500},
+		{"pause_wins_matching_score", false, 1000},
+		{"pause_wins_different_score", false, 500},
+	} {
+		t.Run("pause_races_finish/"+tt.name, func(t *testing.T) {
+			now = start
+			run, err := service.Start(ctx, "Pause finish race")
+			if err != nil {
+				t.Fatal(err)
+			}
+			gate := &gatedOnceWriteStore{
+				Querier: queries, entered: make(chan struct{}), resume: make(chan struct{}), checkpoint: tt.finishFirst,
+			}
+			var once sync.Once
+			release := func() { once.Do(func() { close(gate.resume) }) }
+			defer release()
+			delayed, _ := NewService(gate, DefaultPolicy())
+			delayed.now = func() time.Time { return now }
+			now = start.Add(10 * time.Second)
+			done := make(chan error, 1)
+			go func() {
+				if tt.finishFirst {
+					done <- delayed.Pause(ctx, run.SessionID, run.SessionToken, tt.pauseScore)
+				} else {
+					_, err := delayed.Finish(ctx, run.SessionID, run.SessionToken, 1000)
+					done <- err
+				}
+			}()
+			select {
+			case <-gate.entered:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			var completed Result
+			if tt.finishFirst {
+				completed, err = service.Finish(ctx, run.SessionID, run.SessionToken, 1000)
+			} else {
+				err = service.Pause(ctx, run.SessionID, run.SessionToken, tt.pauseScore)
+				// The pending finish must reload the frozen score and exclude this pause.
+				now = now.Add(10 * time.Second)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			release()
+			select {
+			case err = <-done:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			var id pgtype.UUID
+			_ = id.Scan(run.SessionID)
+			if !tt.finishFirst && tt.pauseScore != 1000 {
+				if !errors.Is(err, ErrRunRejected) || !errors.Is(err, errInvalidScore) {
+					t.Fatalf("finish must not change the frozen score: %v", err)
+				}
+				if _, err := queries.GetSession(ctx, id); !errors.Is(err, pgx.ErrNoRows) {
+					t.Fatalf("rejected finish must delete the unfinished run: %v", err)
+				}
+				return
+			}
+			if tt.finishFirst && !errors.Is(err, ErrSessionFinished) || !tt.finishFirst && err != nil {
+				t.Fatalf("losing request: %v", err)
+			}
+			stored, err := queries.GetSession(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !stored.FinishedAt.Valid || stored.Score.Int64 != 1000 || stored.Paused || result(stored).DurationMS != 10000 {
+				t.Fatalf("unexpected completed state: %+v", stored)
+			}
+			wantPausedUS := int64(0)
+			if !tt.finishFirst {
+				wantPausedUS = (10 * time.Second).Microseconds()
+			}
+			if !stored.FinishedAt.Time.Equal(now) || stored.PausedUs != wantPausedUS {
+				t.Fatalf("finish must use the latest pause state: %+v", stored)
+			}
+			if !tt.finishFirst {
+				completed = result(stored)
+			}
+			// Late transitions cannot change or delete the completed score.
+			for _, transition := range []func(context.Context, string, string, int64) error{service.Pause, service.Resume} {
+				if err := transition(ctx, run.SessionID, run.SessionToken, 2000); !errors.Is(err, ErrSessionFinished) {
+					t.Fatalf("late transition must preserve completion: %v", err)
+				}
+			}
+			if _, err := service.Finish(ctx, run.SessionID, run.SessionToken, 1001); !errors.Is(err, ErrAlreadyFinished) {
+				t.Fatalf("a different final score must conflict: %v", err)
+			}
+			if retry, err := service.Finish(ctx, run.SessionID, run.SessionToken, 1000); err != nil || retry != completed {
+				t.Fatalf("completed result changed: result=%+v error=%v", retry, err)
+			}
+		})
+	}
 	if err := goose.DownToContext(ctx, sqlDB, "../../migrations", 0); err != nil {
 		t.Fatalf("rollback game schema: %v", err)
 	}

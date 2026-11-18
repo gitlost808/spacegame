@@ -344,14 +344,16 @@ func runStore(session *store.GameSession, deleted *bool) stubStore {
 			return *session, nil
 		},
 		checkpoint: func(p store.RecordCheckpointParams) (int64, error) {
-			if *deleted || session.FinishedAt.Valid || !session.CheckpointAt.Before(p.CheckpointAt) {
+			if *deleted || session.FinishedAt.Valid || session.Revision != p.Revision || session.CheckpointAt.After(p.CheckpointAt) {
 				return 0, nil
 			}
 			session.CheckpointScore, session.CheckpointAt = p.CheckpointScore, p.CheckpointAt
+			session.Paused, session.PausedUs = p.Paused, p.PausedUs
+			session.Revision++
 			return 1, nil
 		},
-		delete: func(store.DeleteUnfinishedSessionParams) (int64, error) {
-			if *deleted || session.FinishedAt.Valid {
+		delete: func(p store.DeleteUnfinishedSessionParams) (int64, error) {
+			if *deleted || session.FinishedAt.Valid || session.Revision != p.Revision {
 				return 0, nil
 			}
 			*deleted = true
@@ -359,6 +361,8 @@ func runStore(session *store.GameSession, deleted *bool) stubStore {
 		},
 		finish: func(p store.FinishSessionParams) (store.GameSession, error) {
 			session.Score, session.FinishedAt = p.Score, p.FinishedAt
+			session.Paused, session.PausedUs = false, p.PausedUs
+			session.Revision++
 			return *session, nil
 		},
 	}
@@ -457,7 +461,13 @@ func TestCheckpointLostRace(t *testing.T) {
 	for _, finished := range []bool{false, true} {
 		session, deleted := fixture(), false
 		db := runStore(&session, &deleted)
-		db.checkpoint = func(store.RecordCheckpointParams) (int64, error) {
+		record := db.checkpoint
+		first := true
+		db.checkpoint = func(p store.RecordCheckpointParams) (int64, error) {
+			if !first {
+				return record(p)
+			}
+			first = false
 			if finished {
 				session.Score = pgtype.Int8{Int64: 0, Valid: true}
 				session.FinishedAt = pgtype.Timestamptz{Time: session.StartedAt.Add(time.Second), Valid: true}
@@ -485,5 +495,137 @@ func TestFinishFromLastCheckpoint(t *testing.T) {
 		if _, err := service.Finish(context.Background(), session.ID.String(), "test-token", tt.score); !errors.Is(err, tt.want) {
 			t.Errorf("score %d: error = %v, want %v", tt.score, err, tt.want)
 		}
+	}
+}
+
+func TestPausedRun(t *testing.T) {
+	session, deleted := fixture(), false
+	service, _ := NewService(runStore(&session, &deleted), DefaultPolicy())
+	now := session.StartedAt.Add(10 * time.Second)
+	service.now = func() time.Time { return now }
+	ctx, id := context.Background(), session.ID.String()
+	if err := service.Pause(ctx, id, "test-token", 5000); err != nil {
+		t.Fatal(err)
+	}
+	pausedAt, expiry := session.CheckpointAt, session.ExpiresAt
+	now = now.Add(10 * time.Minute)
+	// Neither retries nor an old client's heartbeat should move the pause timestamp.
+	if err := service.Pause(ctx, id, "test-token", 5000); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Checkpoint(ctx, id, "test-token", 5000); err != nil {
+		t.Fatal(err)
+	}
+	if session.CheckpointAt != pausedAt {
+		t.Fatal("pause timestamp moved")
+	}
+	if err := service.Resume(ctx, id, "test-token", 5000); err != nil {
+		t.Fatal(err)
+	}
+	if session.Paused || session.PausedUs != (10*time.Minute).Microseconds() || session.ExpiresAt != expiry {
+		t.Fatalf("unexpected resumed state: %+v", session)
+	}
+	resumedAt := session.CheckpointAt
+	now = now.Add(time.Second)
+	if err := service.Resume(ctx, id, "test-token", 5000); err != nil {
+		t.Fatal(err)
+	}
+	if session.CheckpointAt != resumedAt {
+		t.Fatal("resume retry moved score clock")
+	}
+	now = now.Add(time.Second)
+	finished, err := service.Finish(ctx, id, "test-token", 7000)
+	if err != nil || finished.DurationMS != 12000 {
+		t.Fatalf("result=%+v error=%v", finished, err)
+	}
+}
+
+func TestPauseSecurity(t *testing.T) {
+	for _, action := range []string{"pause", "resume", "checkpoint", "finish"} {
+		for _, reason := range []string{"score increase", "score decrease", "expired", "wrong token", "finished"} {
+			t.Run(action+"/"+reason, func(t *testing.T) {
+				session, deleted := fixture(), false
+				session.Paused, session.CheckpointScore = true, 500
+				session.CheckpointAt = session.StartedAt.Add(2 * time.Second)
+				now, score, token, want := session.StartedAt.Add(10*time.Minute), int64(500), "test-token", errInvalidScore
+				switch reason {
+				case "score increase":
+					score++
+				case "score decrease":
+					score--
+				case "expired":
+					now, want = session.ExpiresAt.Add(time.Microsecond), errExpired
+				case "wrong token":
+					token, want = "wrong", ErrUnauthorized
+				case "finished":
+					session.FinishedAt = pgtype.Timestamptz{Time: session.StartedAt.Add(time.Second), Valid: true}
+					session.Score = pgtype.Int8{Int64: 499, Valid: true}
+					want = ErrSessionFinished
+					if action == "finish" {
+						want = ErrAlreadyFinished
+					}
+				}
+				service, _ := NewService(runStore(&session, &deleted), DefaultPolicy())
+				service.now = func() time.Time { return now }
+				var err error
+				switch action {
+				case "pause":
+					err = service.Pause(context.Background(), session.ID.String(), token, score)
+				case "resume":
+					err = service.Resume(context.Background(), session.ID.String(), token, score)
+				case "checkpoint":
+					err = service.Checkpoint(context.Background(), session.ID.String(), token, score)
+				case "finish":
+					_, err = service.Finish(context.Background(), session.ID.String(), token, score)
+				}
+				if !errors.Is(err, want) {
+					t.Fatalf("error=%v, want %v", err, want)
+				}
+				if deleted != (reason != "wrong token" && reason != "finished") {
+					t.Fatalf("deleted=%t", deleted)
+				}
+			})
+		}
+	}
+}
+
+func TestPauseCannotBypassActiveChecks(t *testing.T) {
+	for _, scenario := range []string{"late pause", "late resume", "pause score rate", "score after resume", "minimum duration"} {
+		t.Run(scenario, func(t *testing.T) {
+			session, deleted := fixture(), false
+			service, _ := NewService(runStore(&session, &deleted), DefaultPolicy())
+			now := session.StartedAt.Add(31 * time.Second)
+			service.now = func() time.Time { return now }
+			ctx, id, want := context.Background(), session.ID.String(), errMissedCheckpoint
+			var err error
+			switch scenario {
+			case "late pause":
+				err = service.Pause(ctx, id, "test-token", 0)
+			case "late resume":
+				err = service.Resume(ctx, id, "test-token", 0)
+			case "pause score rate":
+				now, want = session.StartedAt.Add(time.Second), errInvalidScore
+				err = service.Pause(ctx, id, "test-token", 1001)
+			default:
+				now = session.StartedAt.Add(500 * time.Millisecond)
+				if err := service.Pause(ctx, id, "test-token", 0); err != nil {
+					t.Fatal(err)
+				}
+				now = now.Add(10 * time.Minute)
+				if scenario == "minimum duration" {
+					want = errTooShort
+					_, err = service.Finish(ctx, id, "test-token", 0)
+				} else {
+					if err := service.Resume(ctx, id, "test-token", 0); err != nil {
+						t.Fatal(err)
+					}
+					want = errInvalidScore
+					err = service.Checkpoint(ctx, id, "test-token", 1)
+				}
+			}
+			if !errors.Is(err, want) || !deleted {
+				t.Fatalf("error=%v deleted=%t", err, deleted)
+			}
+		})
 	}
 }

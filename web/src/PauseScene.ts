@@ -1,4 +1,5 @@
 import Phaser from 'phaser';
+import type GameScene from './GameScene';
 import { constants } from './constants';
 import { MuteButton } from './ui/MuteButton';
 import { MusicButton } from './ui/MusicButton';
@@ -11,6 +12,8 @@ const toHex = (color: number) => `#${color.toString(16).padStart(6, '0')}`;
 // shown over the frozen GameScene, which launches it. The audio controls work here too, and any
 // other tap, P, Esc, Space or Enter resumes the run
 export default class PauseScene extends Phaser.Scene {
+  private resuming = false;
+  private prompt!: Phaser.GameObjects.Text;
   private backdrop!: Phaser.GameObjects.Rectangle;
 
   constructor() {
@@ -18,6 +21,7 @@ export default class PauseScene extends Phaser.Scene {
   }
 
   create(): void {
+    this.resuming = false;
     this.backdrop = this.add.rectangle(0, 0, 1, 1, 0x000000, constants.pauseBackdropAlpha).setOrigin(0);
     this.fitCamera(this.scale.width, this.scale.height);
 
@@ -26,7 +30,7 @@ export default class PauseScene extends Phaser.Scene {
     this.add
       .text(cx, cy - 30, 'PAUSED', { fontSize: '48px', color: toHex(constants.pauseColor) })
       .setOrigin(0.5);
-    const prompt = this.add
+    const prompt = this.prompt = this.add
       .text(cx, cy + 30, 'Press P or tap to resume', { fontSize: '18px', color: '#ffffff' })
       .setOrigin(0.5);
     this.tweens.add({ targets: prompt, alpha: 0.3, duration: 700, yoyo: true, repeat: -1 });
@@ -65,7 +69,23 @@ export default class PauseScene extends Phaser.Scene {
       .setSize(viewWidth, viewHeight);
   }
 
-  private resumeGame(): void {
+  private async resumeGame(): Promise<void> {
+    if (this.resuming) return;
+    this.resuming = true;
+    this.prompt.setText('Resuming…');
+    try {
+      const resumed = await (this.scene.get('GameScene') as GameScene).resumeLeaderboard();
+      if (!resumed) {
+        this.resuming = false;
+        this.prompt.setText('Press P or tap to resume');
+        return;
+      }
+    } catch {
+      this.resuming = false;
+      this.prompt.setText('Could not reconnect. Tap to retry.');
+      return;
+    }
+    if (!this.scene.isActive()) return;
     this.scene.resume('GameScene');
     this.scene.stop();
   }

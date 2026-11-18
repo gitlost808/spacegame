@@ -29,7 +29,7 @@ after pool reuse. Check formation spacing and where the laser stops on the boss.
 The game uses the [backend](../README.md) in this repository
 for shared scores. Before each run, choose a pilot name (1–32 characters); the
 browser remembers it for next time. A session is created before gameplay starts,
-the running score is checkpointed every 10 seconds (also while paused), and game
+the running score is checkpointed every 10 seconds while playing, and game
 over submits the final score with that run's private token. Tokens stay in
 memory. The existing personal high score remains in browser storage.
 
@@ -69,7 +69,9 @@ directory for the 0x29a.me static-site publisher. Production pins the frontend
 and the backend image to the same commit and releases both with one
 infrastructure change, so a push to `main` alone deploys neither. The two still
 restart a few seconds apart, so keep API changes additive: a new client must
-tolerate the previous backend for that moment.
+tolerate the previous backend for that moment. When introducing pause support,
+apply migration 4 and deploy the backend before the frontend so the new pause
+endpoints are available.
 
 The backend ranks individual runs; a pilot name can occur more than once. Names
 are display names, not authenticated accounts.
@@ -90,11 +92,16 @@ The frontend follows the backend's session contract (`LeaderboardRun` in
 `leaderboard/client.ts`):
 
 - Create a named session before gameplay.
-- Every 10 seconds, also while paused, `POST /sessions/:id/checkpoint` with
+- Every 10 seconds while playing, `POST /sessions/:id/checkpoint` with
   `{ "score": <total so far> }` and the session's Bearer token. A run with more
-  than 30 seconds between start, checkpoints and finish is rejected. Checkpoints
+  than 30 seconds between active run updates is rejected. Checkpoints
   never overlap and their scores never go down. A failed or rate-limited
   checkpoint is skipped and the next one tries again.
+- On manual or automatic pause, stop checkpoints and send the frozen score to
+  `POST /sessions/:id/pause`, after any outstanding checkpoint finishes. Paused
+  runs need no heartbeats. Resume sends the same score to `/sessions/:id/resume`
+  and waits for acknowledgement before gameplay continues. Temporary failures
+  retry; if reconnection fails, the pause screen offers another attempt.
 - At game over, stop the checkpoints, wait for one still in flight, then
   `POST /sessions/:id/finish` with the final score, which is at least the last
   checkpoint. Temporary failures are retried with the same score, waiting for
@@ -103,16 +110,15 @@ The frontend follows the backend's session contract (`LeaderboardRun` in
   the run: nothing more is sent and the player is told it doesn't count. A 409 on
   a checkpoint means the run is already finished, so the checkpoints stop.
 
-The game pauses when its tab is hidden, but browsers slow background timers down
-(Chrome to once a minute after five minutes hidden), so a run left in the
-background for long can miss the 30-second window and be rejected.
+The game pauses when its tab is hidden or loses focus. Server-recorded pauses
+survive background timer suspension once the pause request arrives. A browser
+that suspends before delivering that request can still lose the online run;
+pauses cannot repair an already missed active checkpoint. The original one-hour
+session expiry still includes pauses.
 
-The backend calculates duration from its own start and finish timestamps and
-checks:
-
-```text
-0 <= score <= elapsed_seconds * MAX_SCORE_PER_SECOND
-```
+The backend records all timing, excludes pauses from `duration_ms` and the
+minimum duration, and checks score growth against the time since the previous
+active checkpoint. Paused time grants no score allowance.
 
 For the current game tuning and a one-hour session limit, use these as conservative initial settings in the **backend deployment
 configuration**:
@@ -124,8 +130,8 @@ MAX_SCORE_PER_SECOND=300
 ```
 
 The backend defaults to 1000 points per second; 300 is a tighter suggested
-ceiling, not a change to the backend's default. It is a whole-run average, not
-a limit on the points awarded during any single second. Boss kills and bombs
+ceiling, not a change to the backend's default. It bounds the average between checkpoints,
+not the points awarded during any single frame. Boss kills and bombs
 can award many points at once.
 
 The estimate comes from the current scoring and spawning rules:
@@ -149,12 +155,9 @@ estimate. Recalculate when changing scoring, spawn budgets, waves, or the maximu
 session duration; overtime and escalating boss rewards make a fixed ceiling
 increasingly permissive early and potentially too restrictive for longer runs.
 
-**Elapsed session time is not active play time.** Server duration includes
-pauses, time in the background, and delays before a successful finish request.
-The frontend's game clock excludes paused/background time. These settings reject
-implausibly fast scores but cannot establish that someone actually played for
-that duration. A stricter active-play policy needs a backend protocol change;
-simply accepting a client-supplied duration does not make it authoritative.
+The backend excludes explicit pauses but cannot prove that someone actually
+played. Active checkpoint intervals still include network delay. Do not accept
+client-supplied duration as authoritative.
 
 ### Checks
 
