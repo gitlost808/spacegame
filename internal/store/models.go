@@ -20,4 +20,7 @@ type GameSession struct {
 	Score           pgtype.Int8
 	CheckpointAt    time.Time
 	CheckpointScore int64
+	Paused          bool
+	PausedUs        int64
+	Revision        int64
 }

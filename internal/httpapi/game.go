@@ -21,6 +21,8 @@ import (
 type GameService interface {
 	Start(context.Context, string) (game.StartedSession, error)
 	Checkpoint(context.Context, string, string, int64) error
+	Pause(context.Context, string, string, int64) error
+	Resume(context.Context, string, string, int64) error
 	Finish(context.Context, string, string, int64) (game.Result, error)
 	Leaderboard(context.Context, int32) ([]game.Entry, error)
 }
@@ -63,6 +65,23 @@ func (h gameHandler) checkpoint(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 	if err := h.service.Checkpoint(ctx, c.Param("id"), token, score); err != nil {
+		h.writeError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (h gameHandler) pause(c *gin.Context)  { h.transition(c, h.service.Pause) }
+func (h gameHandler) resume(c *gin.Context) { h.transition(c, h.service.Resume) }
+
+func (h gameHandler) transition(c *gin.Context, action func(context.Context, string, string, int64) error) {
+	token, score, ok := h.readScore(c)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	if err := action(ctx, c.Param("id"), token, score); err != nil {
 		h.writeError(c, err)
 		return
 	}

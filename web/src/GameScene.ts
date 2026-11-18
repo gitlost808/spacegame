@@ -53,6 +53,7 @@ export default class GameScene extends Phaser.Scene {
   private nextLaserTickAt = 0;
   private leaderboardSession?: LeaderboardSession;
   private leaderboardRun?: LeaderboardRun;
+  private resumeInterrupted = false;
 
   constructor() {
     super('GameScene');
@@ -189,7 +190,10 @@ export default class GameScene extends Phaser.Scene {
 
     // a phone switching apps or a window losing focus pauses the run, so nothing happens while
     // the player is away
-    const autoPause = () => this.pause();
+    const autoPause = () => {
+      this.resumeInterrupted = true;
+      this.pause();
+    };
     this.game.events.on(Phaser.Core.Events.HIDDEN, autoPause);
     this.game.events.on(Phaser.Core.Events.BLUR, autoPause);
     this.events.on(Phaser.Scenes.Events.RESUME, this.onResume, this);
@@ -229,8 +233,26 @@ export default class GameScene extends Phaser.Scene {
     // a finger lifted while paused never reaches this scene
     this.touch.release();
     this.sound.pauseAll();
+    void this.leaderboardRun?.pause().catch(() => { /* resume retries an unconfirmed pause */ });
     this.scene.pause();
     this.scene.launch('PauseScene');
+  }
+
+  async resumeLeaderboard(): Promise<boolean> {
+    if (document.hidden) return false;
+    this.resumeInterrupted = false;
+    try {
+      await this.leaderboardRun?.resume();
+      // A blur/hidden event can arrive while the server acknowledgement is pending.
+      if (this.resumeInterrupted || document.hidden) {
+        await this.leaderboardRun?.pause();
+        return false;
+      }
+    } catch (error) {
+      // Lost online runs can still continue as local games, as before.
+      if (!this.leaderboardRun?.lostError) throw error;
+    }
+    return !this.resumeInterrupted && !document.hidden;
   }
 
   private onResume(): void {

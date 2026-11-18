@@ -10,28 +10,33 @@ SELECT * FROM game_sessions WHERE id = $1;
 DELETE FROM game_sessions
 WHERE id = sqlc.arg(id)
   AND token_hash = sqlc.arg(token_hash)
-  AND finished_at IS NULL;
+  AND finished_at IS NULL
+  AND revision = sqlc.arg(revision);
 
 -- name: FinishSession :one
 UPDATE game_sessions
-SET score = sqlc.arg(score), finished_at = sqlc.arg(finished_at)
+SET score = sqlc.arg(score), finished_at = sqlc.arg(finished_at),
+    paused = false, paused_us = sqlc.arg(paused_us), revision = revision + 1
 WHERE id = sqlc.arg(id)
   AND token_hash = sqlc.arg(token_hash)
   AND finished_at IS NULL
+  AND revision = sqlc.arg(revision)
   AND expires_at >= sqlc.arg(finished_at)
 RETURNING *;
 
 -- name: RecordCheckpoint :execrows
 UPDATE game_sessions
-SET checkpoint_score = sqlc.arg(checkpoint_score), checkpoint_at = sqlc.arg(checkpoint_at)
+SET checkpoint_score = sqlc.arg(checkpoint_score), checkpoint_at = sqlc.arg(checkpoint_at),
+    paused = sqlc.arg(paused), paused_us = sqlc.arg(paused_us), revision = revision + 1
 WHERE id = sqlc.arg(id)
   AND token_hash = sqlc.arg(token_hash)
   AND finished_at IS NULL
-  AND checkpoint_at < sqlc.arg(checkpoint_at)
+  AND revision = sqlc.arg(revision)
+  AND checkpoint_at <= sqlc.arg(checkpoint_at)
   AND expires_at >= sqlc.arg(checkpoint_at);
 
 -- name: ListLeaderboard :many
-SELECT id, player_name, score, started_at, finished_at
+SELECT id, player_name, score, started_at, finished_at, paused_us
 FROM game_sessions
 WHERE finished_at IS NOT NULL
 ORDER BY score DESC, finished_at ASC, id ASC

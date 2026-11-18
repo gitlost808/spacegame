@@ -116,6 +116,16 @@ export class LeaderboardClient {
     }, signal);
   }
 
+  async setPaused(session: LeaderboardSession, score: number, paused: boolean, signal?: AbortSignal): Promise<void> {
+    validateScore(score);
+    await this.request<void>(`/sessions/${encodeURIComponent(session.session_id)}/${paused ? 'pause' : 'resume'}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${session.session_token}` },
+      body: JSON.stringify({ score }),
+      keepalive: paused,
+    }, signal);
+  }
+
   async finishRun(session: LeaderboardSession, score: number, signal?: AbortSignal): Promise<RunResult> {
     validateScore(score);
     const result = await this.request<RunResult>(`/sessions/${encodeURIComponent(session.session_id)}/finish`, {
@@ -194,14 +204,14 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 
 export interface RunOptions {
   checkpointIntervalMs?: number;
-  // first finish retry; doubles after each failure
+  // first transition/finish retry; doubles after each failure
   retryDelayMs?: number;
   finishAttempts?: number;
 }
 
 // One online run: checkpoints its score so the backend can follow it, then finishes it.
-// The backend drops a run that goes quiet for 30s, so checkpoints run on a real timer that keeps
-// going while the game is paused, one request at a time.
+// Active runs checkpoint on a real timer. Explicit server pauses freeze the score
+// without depending on timers that browsers suspend in background tabs.
 export class LeaderboardRun {
   // set once the backend has dropped the run (or refused this client); nothing more is sent
   lostError?: LeaderboardError;
@@ -219,6 +229,10 @@ export class LeaderboardRun {
   // the highest score sent in a checkpoint; the final score can't be lower
   private lastScore = 0;
   private finalScore?: number;
+  private pauseScore?: number;
+  private pauseConfirmed = false;
+  private pauseTask?: Promise<void>;
+  private resumeTask?: Promise<void>;
 
   constructor(
     client: LeaderboardClient,
@@ -235,8 +249,55 @@ export class LeaderboardRun {
   }
 
   start(): void {
-    if (this.timer || this.finalScore !== undefined || this.lostError) return;
+    if (this.pauseScore !== undefined || this.controller.signal.aborted || this.timer || this.finalScore !== undefined || this.lostError) return;
     this.timer = setInterval(() => this.checkpoint(), this.intervalMs);
+  }
+
+  // Freeze locally immediately, serialize behind any checkpoint, and record the
+  // exact frozen score. Retrying a lost acknowledgement is safe on the server.
+  pause(): Promise<void> {
+    if (this.pauseTask) return this.pauseTask;
+    if (this.pauseConfirmed) return Promise.resolve();
+    this.stopCheckpoints();
+    this.pauseScore ??= this.lastScore = Math.max(this.getScore(), this.lastScore);
+    this.pauseTask = (async () => {
+      await this.inFlight;
+      await this.transition(true);
+      this.pauseConfirmed = true;
+    })().finally(() => { this.pauseTask = undefined; });
+    return this.pauseTask;
+  }
+
+  // Gameplay must remain frozen until this resolves: otherwise points earned
+  // during a pending resume would be attributed to paused time.
+  resume(): Promise<void> {
+    if (this.resumeTask) return this.resumeTask;
+    if (this.pauseScore === undefined) return Promise.resolve();
+    this.resumeTask = (async () => {
+      try { await this.pauseTask; } catch { /* retry an unconfirmed pause below */ }
+      await this.pause();
+      await this.transition(false);
+      this.pauseScore = undefined;
+      this.pauseConfirmed = false;
+      this.start();
+    })().finally(() => { this.resumeTask = undefined; });
+    return this.resumeTask;
+  }
+
+  private async transition(paused: boolean): Promise<void> {
+    for (let attempt = 1; ; attempt++) {
+      if (this.lostError) throw this.lostError;
+      if (this.controller.signal.aborted) throw new LeaderboardError('The run was cancelled.');
+      try {
+        await this.client.setPaused(this.session, this.pauseScore!, paused, this.controller.signal);
+        return;
+      } catch (error) {
+        if (error instanceof LeaderboardError) this.handleFatal(error);
+        if (this.controller.signal.aborted || !(error instanceof LeaderboardError) ||
+            !error.retryable || attempt >= this.finishAttempts) throw error;
+        await sleep(error.retryAfterMs ?? this.retryDelayMs * 2 ** (attempt - 1), this.controller.signal);
+      }
+    }
   }
 
   // abandon the run, e.g. when the scene shuts down; the backend expires it on its own

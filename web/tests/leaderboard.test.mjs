@@ -368,3 +368,128 @@ test('stopping a run aborts its checkpoint and sends nothing more', async t => {
   assert.equal(fetch.mock.callCount(), 1);
   assert.equal(run.lostError, undefined);
 });
+
+test('pause and resume send the frozen score with authentication', async t => {
+  const calls = [];
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    calls.push({ url, options });
+    return noContent();
+  });
+  const client = new LeaderboardClient('');
+  for (const paused of [true, false]) await client.setPaused(session, 42, paused);
+  assert.deepEqual(calls.map(call => call.url.split('/').pop()), ['pause', 'resume']);
+  for (const { options } of calls) {
+    assert.equal(options.headers.Authorization, `Bearer ${session.session_token}`);
+    assert.deepEqual(JSON.parse(options.body), { score: 42 });
+  }
+});
+
+test('a paused run sends no heartbeats and waits for resume acknowledgement', async t => {
+  const calls = [];
+  let acknowledgeResume;
+  let score = 42;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    const kind = url.split('/').pop();
+    calls.push({ kind, score: JSON.parse(options.body).score });
+    if (kind === 'resume') await new Promise(resolve => { acknowledgeResume = resolve; });
+    return noContent();
+  });
+  const run = new LeaderboardRun(new LeaderboardClient(''), session, () => score, fast);
+  t.after(() => run.stop());
+  run.start();
+  await run.pause();
+  await delay(60);
+  assert.deepEqual(calls, [{ kind: 'pause', score: 42 }]);
+  const resume = run.resume();
+  await delay(40);
+  assert.deepEqual(calls.map(call => call.kind), ['pause', 'resume']);
+  acknowledgeResume();
+  await resume;
+  score = 50;
+  await delay(30);
+  assert.deepEqual(calls[2], { kind: 'checkpoint', score: 50 });
+});
+
+test('pause waits for an outstanding checkpoint and rapid resume preserves order', async t => {
+  const calls = [];
+  let checkpointStarted;
+  const started = new Promise(resolve => { checkpointStarted = resolve; });
+  let acknowledgeCheckpoint;
+  t.mock.method(globalThis, 'fetch', async url => {
+    const kind = url.split('/').pop();
+    calls.push(kind);
+    if (kind === 'checkpoint') {
+      checkpointStarted();
+      await new Promise(resolve => { acknowledgeCheckpoint = resolve; });
+    }
+    return noContent();
+  });
+  const run = new LeaderboardRun(new LeaderboardClient(''), session, () => 42, fast);
+  t.after(() => run.stop());
+  run.start();
+  await started;
+  const pause = run.pause();
+  const resume = run.resume();
+  assert.deepEqual(calls, ['checkpoint']);
+  acknowledgeCheckpoint();
+  await Promise.all([pause, resume]);
+  assert.deepEqual(calls, ['checkpoint', 'pause', 'resume']);
+});
+
+test('lost pause acknowledgement retries the same frozen score', async t => {
+  const scores = [];
+  t.mock.method(globalThis, 'fetch', async (_url, options) => {
+    scores.push(JSON.parse(options.body).score);
+    if (scores.length === 1) throw new TypeError('Acknowledgement lost');
+    return noContent();
+  });
+  const run = new LeaderboardRun(new LeaderboardClient(''), session, () => 42, fast);
+  t.after(() => run.stop());
+  await run.pause();
+  await run.pause();
+  assert.deepEqual(scores, [42, 42]);
+});
+
+test('failed resume keeps gameplay paused and a later attempt can reconnect', async t => {
+  const calls = [];
+  let unavailable = true;
+  t.mock.method(globalThis, 'fetch', async url => {
+    const kind = url.split('/').pop();
+    calls.push(kind);
+    if (kind === 'resume' && unavailable) return json({}, 503);
+    return noContent();
+  });
+  const run = new LeaderboardRun(new LeaderboardClient(''), session, () => 42, { ...fast, finishAttempts: 2 });
+  t.after(() => run.stop());
+  run.start();
+  await run.pause();
+  await assert.rejects(run.resume(), LeaderboardError);
+  await delay(50);
+  assert.deepEqual(calls, ['pause', 'resume', 'resume']);
+  unavailable = false;
+  await run.resume();
+  assert.equal(run.lostError, undefined);
+  assert.deepEqual(calls, ['pause', 'resume', 'resume', 'resume']);
+});
+
+test('an unconfirmed pause is retried before resuming, while permanent failures end the online run', async t => {
+  const calls = [];
+  let status = 503;
+  t.mock.method(globalThis, 'fetch', async url => {
+    calls.push(url.split('/').pop());
+    return status === 204 ? noContent() : json({}, status);
+  });
+  const run = new LeaderboardRun(new LeaderboardClient(''), session, () => 42, { ...fast, finishAttempts: 1 });
+  t.after(() => run.stop());
+  await assert.rejects(run.pause());
+  status = 204;
+  await run.resume();
+  assert.deepEqual(calls, ['pause', 'pause', 'resume']);
+  status = 422;
+  let lost = 0;
+  run.onLost = () => lost++;
+  await assert.rejects(run.pause());
+  await assert.rejects(run.resume());
+  assert.equal(lost, 1);
+  assert.equal(run.lostError.status, 422);
+});

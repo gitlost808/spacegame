@@ -140,6 +140,17 @@ curl -X POST http://localhost:8080/api/v1/sessions/SESSION_ID/checkpoint \
   -d '{"score":500}'
 ```
 
+To pause, send `POST /api/v1/sessions/SESSION_ID/pause` with the same Bearer
+token and `{ "score": <current total> }`. Pause validates and records the final
+active checkpoint. The score then stays frozen and no heartbeats are needed.
+Before gameplay resumes, send `POST /api/v1/sessions/SESSION_ID/resume` with
+exactly that frozen score and wait for HTTP 204. Both endpoints are idempotent
+for retries in the same state. Resume restarts the score clock at the server's
+current time, so a pause cannot accumulate score allowance. Neither endpoint
+extends the session's original expiry (`SESSION_MAX_DURATION`, including pauses).
+A pause must reach the server within the active checkpoint gap; it cannot repair
+an already missed checkpoint or a lost connection after the browser suspends.
+
 An accepted checkpoint returns HTTP 204. Checkpoints on a finished run return
 HTTP 409. When gameplay ends, finish the run with the final score:
 
@@ -151,7 +162,7 @@ curl -X POST http://localhost:8080/api/v1/sessions/SESSION_ID/finish \
 ```
 
 The response contains the session ID, player name, score, start/finish times, and
-`duration_ms`. Duration is calculated from server-recorded times; the client
+`duration_ms`. Duration excludes server-recorded pauses; the client
 submits only an integer score. Zero is valid. A valid finish is atomic and
 cannot be overwritten. Retrying the same score with the same token returns the
 original result, including after expiry. A different score returns HTTP 409.
@@ -167,18 +178,20 @@ Validation uses these configurable starter defaults:
 
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
-| `SESSION_MIN_DURATION` | `1s` | Shortest accepted run; may be set to `0s` |
+| `SESSION_MIN_DURATION` | `1s` | Shortest accepted active duration; may be set to `0s` |
 | `SESSION_MAX_DURATION` | `1h` | Lifetime of a newly started session |
 | `MAX_SCORE_PER_SECOND` | `1000` | Highest accepted score rate between checkpoints |
-| `SESSION_MAX_CHECKPOINT_GAP` | `30s` | Longest allowed time between start, checkpoints, and finish |
+| `SESSION_MAX_CHECKPOINT_GAP` | `30s` | Longest allowed gap between active run updates |
 | `CORS_ALLOWED_ORIGINS` | empty | Comma-separated browser origins allowed to read the API |
 
 Tune these limits to the game's scoring rules. Each checkpoint and the final
 score must not decrease, and may grow by at most `MAX_SCORE_PER_SECOND` per
-second since the previous checkpoint (or the start). No gap between start,
-checkpoints, and finish may exceed `SESSION_MAX_CHECKPOINT_GAP`, so a session
-left idle cannot later claim a score. Runs must also last at least
-`SESSION_MIN_DURATION` and end before the session expires.
+second since the previous checkpoint (or the start). While active, no gap between start,
+checkpoints, pause, and finish may exceed `SESSION_MAX_CHECKPOINT_GAP`, so a session
+left idle cannot later claim a score. While paused, all submitted scores must
+exactly match the frozen score. Runs must also have at least
+`SESSION_MIN_DURATION` of active time and end before the session expires. All
+state updates and rejections use conditional writes and revalidate after races.
 
 Any failed check returns HTTP 422 with `{"error":"run rejected"}` and deletes
 the unfinished session. The response does not say which limit failed, so

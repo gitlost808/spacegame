@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
@@ -54,6 +55,29 @@ func (s gatedFinishStore) DeleteUnfinishedSession(ctx context.Context, p store.D
 		}
 	}
 	return s.Querier.DeleteUnfinishedSession(ctx, p)
+}
+
+// Block only the first write so a losing finish can reload and revalidate.
+type gatedOnceFinishStore struct {
+	store.Querier
+	entered, resume chan struct{}
+	once            sync.Once
+}
+
+func (s *gatedOnceFinishStore) FinishSession(ctx context.Context, p store.FinishSessionParams) (store.GameSession, error) {
+	var err error
+	s.once.Do(func() {
+		close(s.entered)
+		select {
+		case <-s.resume:
+		case <-ctx.Done():
+			err = ctx.Err()
+		}
+	})
+	if err != nil {
+		return store.GameSession{}, err
+	}
+	return s.Querier.FinishSession(ctx, p)
 }
 
 func TestPostgresGameSessions(t *testing.T) {
@@ -329,6 +353,113 @@ func TestPostgresGameSessions(t *testing.T) {
 		}
 		if err := service.Checkpoint(ctx, idle.SessionID, idle.SessionToken, 0); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("a rejected run must be deleted: %v", err)
+		}
+	})
+	t.Run("persisted_pause_and_conditional_writes", func(t *testing.T) {
+		now = start
+		run, err := service.Start(ctx, "Paused")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var id pgtype.UUID
+		_ = id.Scan(run.SessionID)
+		before, err := queries.GetSession(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		now = start.Add(10 * time.Second)
+		if err := service.Pause(ctx, run.SessionID, run.SessionToken, 5000); err != nil {
+			t.Fatal(err)
+		}
+		// These were validated before pause. None may overwrite or delete its state.
+		if n, err := queries.RecordCheckpoint(ctx, store.RecordCheckpointParams{
+			ID: id, TokenHash: before.TokenHash, Revision: before.Revision,
+			CheckpointAt: now, CheckpointScore: 10000,
+		}); err != nil || n != 0 {
+			t.Fatalf("stale checkpoint: n=%d error=%v", n, err)
+		}
+		if _, err := queries.FinishSession(ctx, store.FinishSessionParams{
+			ID: id, TokenHash: before.TokenHash, Revision: before.Revision,
+			Score: pgtype.Int8{Int64: 10000, Valid: true}, FinishedAt: pgtype.Timestamptz{Time: now, Valid: true},
+		}); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("stale finish: %v", err)
+		}
+		if n, err := queries.DeleteUnfinishedSession(ctx, store.DeleteUnfinishedSessionParams{
+			ID: id, TokenHash: before.TokenHash, Revision: before.Revision,
+		}); err != nil || n != 0 {
+			t.Fatalf("stale rejection: n=%d error=%v", n, err)
+		}
+		reloaded, _ := NewService(queries, DefaultPolicy())
+		reloaded.now = func() time.Time { return now }
+		now = start.Add(10 * time.Minute)
+		if err := reloaded.Checkpoint(ctx, run.SessionID, run.SessionToken, 5000); err != nil {
+			t.Fatal(err)
+		}
+		if err := reloaded.Pause(ctx, run.SessionID, run.SessionToken, 5000); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 2; i++ {
+			if err := reloaded.Resume(ctx, run.SessionID, run.SessionToken, 5000); err != nil {
+				t.Fatal(err)
+			}
+		}
+		now = now.Add(2 * time.Second)
+		finished, err := reloaded.Finish(ctx, run.SessionID, run.SessionToken, 7000)
+		if err != nil || finished.DurationMS != 12000 {
+			t.Fatalf("finish=%+v error=%v", finished, err)
+		}
+		entries, err := reloaded.Leaderboard(ctx, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, entry := range entries {
+			if entry.SessionID == run.SessionID {
+				found = true
+				if entry.DurationMS != finished.DurationMS {
+					t.Fatalf("leaderboard duration=%d", entry.DurationMS)
+				}
+			}
+		}
+		if !found {
+			t.Fatal("paused run missing from leaderboard")
+		}
+	})
+	t.Run("finish_revalidates_after_concurrent_pause_and_resume", func(t *testing.T) {
+		now = start
+		run, err := service.Start(ctx, "Racing pause")
+		if err != nil {
+			t.Fatal(err)
+		}
+		gate := &gatedOnceFinishStore{Querier: queries, entered: make(chan struct{}), resume: make(chan struct{})}
+		stale, _ := NewService(gate, DefaultPolicy())
+		stale.now = func() time.Time { return now }
+		now = start.Add(10 * time.Second)
+		done := make(chan error, 1)
+		go func() { _, err := stale.Finish(ctx, run.SessionID, run.SessionToken, 10000); done <- err }()
+		select {
+		case <-gate.entered:
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		var once sync.Once
+		release := func() { once.Do(func() { close(gate.resume) }) }
+		defer release()
+		if err := service.Pause(ctx, run.SessionID, run.SessionToken, 0); err != nil {
+			t.Fatal(err)
+		}
+		now = start.Add(10 * time.Minute)
+		if err := service.Resume(ctx, run.SessionID, run.SessionToken, 0); err != nil {
+			t.Fatal(err)
+		}
+		release()
+		select {
+		case err := <-done:
+			if !errors.Is(err, errInvalidScore) || !errors.Is(err, ErrRunRejected) {
+				t.Fatalf("stale finish accepted: %v", err)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
 		}
 	})
 	if err := goose.DownToContext(ctx, sqlDB, "../../migrations", 0); err != nil {

@@ -15,7 +15,7 @@ import (
 const createSession = `-- name: CreateSession :one
 INSERT INTO game_sessions (player_name, token_hash, started_at, expires_at, checkpoint_at)
 VALUES ($1, $2, $3, $4, $3)
-RETURNING id, player_name, token_hash, started_at, expires_at, finished_at, score, checkpoint_at, checkpoint_score
+RETURNING id, player_name, token_hash, started_at, expires_at, finished_at, score, checkpoint_at, checkpoint_score, paused, paused_us, revision
 `
 
 type CreateSessionParams struct {
@@ -43,6 +43,9 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (G
 		&i.Score,
 		&i.CheckpointAt,
 		&i.CheckpointScore,
+		&i.Paused,
+		&i.PausedUs,
+		&i.Revision,
 	)
 	return i, err
 }
@@ -78,15 +81,17 @@ DELETE FROM game_sessions
 WHERE id = $1
   AND token_hash = $2
   AND finished_at IS NULL
+  AND revision = $3
 `
 
 type DeleteUnfinishedSessionParams struct {
 	ID        pgtype.UUID
 	TokenHash []byte
+	Revision  int64
 }
 
 func (q *Queries) DeleteUnfinishedSession(ctx context.Context, arg DeleteUnfinishedSessionParams) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteUnfinishedSession, arg.ID, arg.TokenHash)
+	result, err := q.db.Exec(ctx, deleteUnfinishedSession, arg.ID, arg.TokenHash, arg.Revision)
 	if err != nil {
 		return 0, err
 	}
@@ -95,27 +100,33 @@ func (q *Queries) DeleteUnfinishedSession(ctx context.Context, arg DeleteUnfinis
 
 const finishSession = `-- name: FinishSession :one
 UPDATE game_sessions
-SET score = $1, finished_at = $2
-WHERE id = $3
-  AND token_hash = $4
+SET score = $1, finished_at = $2,
+    paused = false, paused_us = $3, revision = revision + 1
+WHERE id = $4
+  AND token_hash = $5
   AND finished_at IS NULL
+  AND revision = $6
   AND expires_at >= $2
-RETURNING id, player_name, token_hash, started_at, expires_at, finished_at, score, checkpoint_at, checkpoint_score
+RETURNING id, player_name, token_hash, started_at, expires_at, finished_at, score, checkpoint_at, checkpoint_score, paused, paused_us, revision
 `
 
 type FinishSessionParams struct {
 	Score      pgtype.Int8
 	FinishedAt pgtype.Timestamptz
+	PausedUs   int64
 	ID         pgtype.UUID
 	TokenHash  []byte
+	Revision   int64
 }
 
 func (q *Queries) FinishSession(ctx context.Context, arg FinishSessionParams) (GameSession, error) {
 	row := q.db.QueryRow(ctx, finishSession,
 		arg.Score,
 		arg.FinishedAt,
+		arg.PausedUs,
 		arg.ID,
 		arg.TokenHash,
+		arg.Revision,
 	)
 	var i GameSession
 	err := row.Scan(
@@ -128,12 +139,15 @@ func (q *Queries) FinishSession(ctx context.Context, arg FinishSessionParams) (G
 		&i.Score,
 		&i.CheckpointAt,
 		&i.CheckpointScore,
+		&i.Paused,
+		&i.PausedUs,
+		&i.Revision,
 	)
 	return i, err
 }
 
 const getSession = `-- name: GetSession :one
-SELECT id, player_name, token_hash, started_at, expires_at, finished_at, score, checkpoint_at, checkpoint_score FROM game_sessions WHERE id = $1
+SELECT id, player_name, token_hash, started_at, expires_at, finished_at, score, checkpoint_at, checkpoint_score, paused, paused_us, revision FROM game_sessions WHERE id = $1
 `
 
 func (q *Queries) GetSession(ctx context.Context, id pgtype.UUID) (GameSession, error) {
@@ -149,12 +163,15 @@ func (q *Queries) GetSession(ctx context.Context, id pgtype.UUID) (GameSession, 
 		&i.Score,
 		&i.CheckpointAt,
 		&i.CheckpointScore,
+		&i.Paused,
+		&i.PausedUs,
+		&i.Revision,
 	)
 	return i, err
 }
 
 const listLeaderboard = `-- name: ListLeaderboard :many
-SELECT id, player_name, score, started_at, finished_at
+SELECT id, player_name, score, started_at, finished_at, paused_us
 FROM game_sessions
 WHERE finished_at IS NOT NULL
 ORDER BY score DESC, finished_at ASC, id ASC
@@ -167,6 +184,7 @@ type ListLeaderboardRow struct {
 	Score      pgtype.Int8
 	StartedAt  time.Time
 	FinishedAt pgtype.Timestamptz
+	PausedUs   int64
 }
 
 func (q *Queries) ListLeaderboard(ctx context.Context, limit int32) ([]ListLeaderboardRow, error) {
@@ -184,6 +202,7 @@ func (q *Queries) ListLeaderboard(ctx context.Context, limit int32) ([]ListLeade
 			&i.Score,
 			&i.StartedAt,
 			&i.FinishedAt,
+			&i.PausedUs,
 		); err != nil {
 			return nil, err
 		}
@@ -197,27 +216,35 @@ func (q *Queries) ListLeaderboard(ctx context.Context, limit int32) ([]ListLeade
 
 const recordCheckpoint = `-- name: RecordCheckpoint :execrows
 UPDATE game_sessions
-SET checkpoint_score = $1, checkpoint_at = $2
-WHERE id = $3
-  AND token_hash = $4
+SET checkpoint_score = $1, checkpoint_at = $2,
+    paused = $3, paused_us = $4, revision = revision + 1
+WHERE id = $5
+  AND token_hash = $6
   AND finished_at IS NULL
-  AND checkpoint_at < $2
+  AND revision = $7
+  AND checkpoint_at <= $2
   AND expires_at >= $2
 `
 
 type RecordCheckpointParams struct {
 	CheckpointScore int64
 	CheckpointAt    time.Time
+	Paused          bool
+	PausedUs        int64
 	ID              pgtype.UUID
 	TokenHash       []byte
+	Revision        int64
 }
 
 func (q *Queries) RecordCheckpoint(ctx context.Context, arg RecordCheckpointParams) (int64, error) {
 	result, err := q.db.Exec(ctx, recordCheckpoint,
 		arg.CheckpointScore,
 		arg.CheckpointAt,
+		arg.Paused,
+		arg.PausedUs,
 		arg.ID,
 		arg.TokenHash,
+		arg.Revision,
 	)
 	if err != nil {
 		return 0, err

@@ -21,6 +21,8 @@ import (
 type stubGame struct {
 	start      func(string) (game.StartedSession, error)
 	checkpoint func(string, string, int64) error
+	pause      func(string, string, int64) error
+	resume     func(string, string, int64) error
 	finish     func(string, string, int64) (game.Result, error)
 	list       func(int32) ([]game.Entry, error)
 }
@@ -30,6 +32,12 @@ func (s stubGame) Start(_ context.Context, name string) (game.StartedSession, er
 }
 func (s stubGame) Checkpoint(_ context.Context, id, token string, score int64) error {
 	return s.checkpoint(id, token, score)
+}
+func (s stubGame) Pause(_ context.Context, id, token string, score int64) error {
+	return s.pause(id, token, score)
+}
+func (s stubGame) Resume(_ context.Context, id, token string, score int64) error {
+	return s.resume(id, token, score)
 }
 func (s stubGame) Finish(_ context.Context, id, token string, score int64) (game.Result, error) {
 	return s.finish(id, token, score)
@@ -74,6 +82,18 @@ func TestGameEndpoints(t *testing.T) {
 			}
 			return nil
 		},
+		pause: func(id, token string, score int64) error {
+			if id != "session-id" || token != "secret-token" || score != 500 {
+				t.Fatalf("pause arguments = %q %q %d", id, token, score)
+			}
+			return nil
+		},
+		resume: func(id, token string, score int64) error {
+			if id != "session-id" || token != "secret-token" || score != 500 {
+				t.Fatalf("resume arguments = %q %q %d", id, token, score)
+			}
+			return nil
+		},
 		finish: func(id, token string, score int64) (game.Result, error) {
 			if id != "session-id" || token != "secret-token" || score != 0 {
 				t.Errorf("finish arguments = %q, %q, %d", id, token, score)
@@ -97,6 +117,12 @@ func TestGameEndpoints(t *testing.T) {
 	checkpoint := request(handler, http.MethodPost, "/api/v1/sessions/session-id/checkpoint", `{"score":500}`, "secret-token")
 	if checkpoint.Code != http.StatusNoContent || checkpoint.Body.Len() != 0 {
 		t.Fatalf("checkpoint: %d %s", checkpoint.Code, checkpoint.Body)
+	}
+	for _, action := range []string{"pause", "resume"} {
+		w := request(handler, http.MethodPost, "/api/v1/sessions/session-id/"+action, `{"score":500}`, "secret-token")
+		if w.Code != http.StatusNoContent || w.Body.Len() != 0 {
+			t.Fatalf("%s: %d %s", action, w.Code, w.Body)
+		}
 	}
 	finish := request(handler, http.MethodPost, "/api/v1/sessions/session-id/finish", `{"score":0}`, "secret-token")
 	if finish.Code != http.StatusOK || strings.Contains(finish.Body.String(), "token") {
@@ -130,6 +156,10 @@ func TestGameRequestValidation(t *testing.T) {
 		{"checkpoint missing authorization", "POST", "/api/v1/sessions/id/checkpoint", `{"score":0}`, "", "application/json", 401},
 		{"checkpoint missing score", "POST", "/api/v1/sessions/id/checkpoint", `{}`, "token", "application/json", 400},
 		{"checkpoint wrong content type", "POST", "/api/v1/sessions/id/checkpoint", `{"score":0}`, "token", "text/plain", 415},
+		{"pause missing authorization", "POST", "/api/v1/sessions/id/pause", `{"score":0}`, "", "application/json", 401},
+		{"pause missing score", "POST", "/api/v1/sessions/id/pause", `{}`, "token", "application/json", 400},
+		{"resume missing authorization", "POST", "/api/v1/sessions/id/resume", `{"score":0}`, "", "application/json", 401},
+		{"resume null score", "POST", "/api/v1/sessions/id/resume", `{"score":null}`, "token", "application/json", 400},
 		{"zero limit", "GET", "/api/v1/leaderboard?limit=0", "", "", "", 400},
 		{"large limit", "GET", "/api/v1/leaderboard?limit=101", "", "", "", 400},
 		{"invalid limit", "GET", "/api/v1/leaderboard?limit=abc", "", "", "", 400},
@@ -185,9 +215,11 @@ func TestGameErrors(t *testing.T) {
 		t.Run(tt.err.Error(), func(t *testing.T) {
 			handler := gameRouter(stubGame{
 				checkpoint: func(string, string, int64) error { return tt.err },
+				pause:      func(string, string, int64) error { return tt.err },
+				resume:     func(string, string, int64) error { return tt.err },
 				finish:     func(string, string, int64) (game.Result, error) { return game.Result{}, tt.err },
 			})
-			for _, path := range []string{"/api/v1/sessions/id/checkpoint", "/api/v1/sessions/id/finish"} {
+			for _, path := range []string{"/api/v1/sessions/id/checkpoint", "/api/v1/sessions/id/finish", "/api/v1/sessions/id/pause", "/api/v1/sessions/id/resume"} {
 				w := request(handler, http.MethodPost, path, `{"score":0}`, "token")
 				if w.Code != tt.status {
 					t.Fatalf("%s: response = %d %s, want %d", path, w.Code, w.Body, tt.status)
