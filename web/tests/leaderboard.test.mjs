@@ -450,6 +450,36 @@ test('lost pause acknowledgement retries the same frozen score', async t => {
   assert.deepEqual(scores, [42, 42]);
 });
 
+test('a second pause captures the score earned after resuming', async t => {
+  const calls = [];
+  let score = 0;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    const kind = url.split('/').pop();
+    const sentScore = JSON.parse(options.body).score;
+    calls.push({ kind, score: sentScore });
+    return kind === 'finish' ? json({ ...result, score: sentScore }) : noContent();
+  });
+  const run = new LeaderboardRun(new LeaderboardClient(''), session, () => score,
+    { checkpointIntervalMs: 60_000 });
+  t.after(() => run.stop());
+  run.start();
+  await run.pause();
+  await run.resume();
+  score = 77;
+  await run.pause();
+  score = 99;
+  await run.pause(); // A duplicate pause keeps the second pause's frozen score.
+  await run.resume();
+  await run.finish(100);
+  assert.deepEqual(calls, [
+    { kind: 'pause', score: 0 },
+    { kind: 'resume', score: 0 },
+    { kind: 'pause', score: 77 },
+    { kind: 'resume', score: 77 },
+    { kind: 'finish', score: 100 },
+  ]);
+});
+
 test('failed resume keeps gameplay paused and a later attempt can reconnect', async t => {
   const calls = [];
   let unavailable = true;
