@@ -22,6 +22,8 @@ type Metrics struct {
 	deleted        prometheus.Counter
 	cleanupSuccess prometheus.Gauge
 	cleanupErrors  prometheus.Counter
+	cleanupBacklog prometheus.Gauge
+	saturated      prometheus.Counter
 }
 
 func NewMetrics() *Metrics {
@@ -46,8 +48,15 @@ func NewMetrics() *Metrics {
 		cleanupErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "spacegame_cleanup_errors_total", Help: "Failed cleanup sweeps.",
 		}),
+		cleanupBacklog: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "spacegame_cleanup_backlog", Help: "One when the most recent successful cleanup sweep reached its batch cap.",
+		}),
+		saturated: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "spacegame_cleanup_saturated_sweeps_total", Help: "Cleanup sweeps that reached their batch cap.",
+		}),
 	}
 	m.registry.MustRegister(m.requests, m.durations, m.ready, m.deleted, m.cleanupSuccess, m.cleanupErrors,
+		m.cleanupBacklog, m.saturated,
 		collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	return m
 }
@@ -66,12 +75,18 @@ func (m *Metrics) SetReady(ready bool) {
 	}
 }
 
-func (m *Metrics) ObserveCleanup(deleted int64, err error) {
+func (m *Metrics) ObserveCleanup(deleted int64, saturated bool, err error) {
 	m.deleted.Add(float64(deleted))
 	if err != nil {
 		m.cleanupErrors.Inc()
+		return
+	}
+	m.cleanupSuccess.SetToCurrentTime()
+	if saturated {
+		m.saturated.Inc()
+		m.cleanupBacklog.Set(1)
 	} else {
-		m.cleanupSuccess.SetToCurrentTime()
+		m.cleanupBacklog.Set(0)
 	}
 }
 

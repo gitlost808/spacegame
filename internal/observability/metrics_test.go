@@ -32,12 +32,13 @@ func TestRequestMetricsAndRedactedLogs(t *testing.T) {
 		}
 	}
 	metrics.SetReady(true)
-	metrics.ObserveCleanup(3, nil)
+	metrics.ObserveCleanup(3, true, nil)
 	scrape := httptest.NewRecorder()
 	metrics.Handler().ServeHTTP(scrape, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	for _, expected := range []string{
 		`spacegame_http_requests_total{method="POST",route="/sessions/:id/finish",status="409"} 1`,
 		"spacegame_ready 1", "spacegame_expired_sessions_deleted_total 3",
+		"spacegame_cleanup_backlog 1", "spacegame_cleanup_saturated_sweeps_total 1",
 		"spacegame_http_request_duration_seconds_count", "go_goroutines",
 	} {
 		if !strings.Contains(scrape.Body.String(), expected) {

@@ -24,7 +24,7 @@ import { BossHealthBar } from './ui/BossHealthBar';
 import { playMusic, playSound, randomDetune, stopMusic } from './utils/audio';
 import { fitPlayfieldCamera } from './utils/playfield';
 import { RunSetup, openRunDialog } from './leaderboard/dialogs';
-import { LeaderboardRun, LeaderboardSession } from './leaderboard/client';
+import { LeaderboardRun, LeaderboardSession, ScoreSaveState, pendingScoreSaves } from './leaderboard/client';
 import { leaderboard } from './leaderboard';
 
 export default class GameScene extends Phaser.Scene {
@@ -114,6 +114,7 @@ export default class GameScene extends Phaser.Scene {
     );
     this.effects = new EffectsSystem(this);
     this.startLeaderboardRun();
+    this.showPendingSave();
     this.muteButton = new MuteButton(this);
     this.musicButton = new MusicButton(this);
     this.pauseButton = new PauseButton(this, () => this.pause());
@@ -226,12 +227,38 @@ export default class GameScene extends Phaser.Scene {
     this.leaderboardRun = run;
   }
 
+  // A score save from an earlier run can still be in flight or retrying after a restart: report how
+  // it ends, so the result is never dropped silently.
+  private showPendingSave(): void {
+    const save = pendingScoreSaves().at(-1);
+    if (!save) return;
+    const text = this.add.text(10, 95, '', { fontSize: '14px', color: '#cccccc' }).setDepth(50);
+    const describe = (state: ScoreSaveState) => {
+      switch (state.status) {
+        case 'saving': return ['Saving previous score…', '#cccccc'];
+        case 'retrying': return ['Previous score not saved yet • retrying', '#b58900'];
+        case 'saved': return ['Previous score saved to leaderboard', '#859900'];
+        case 'failed': return [`Previous score not saved: ${state.error.message}`, '#dc322f'];
+      }
+    };
+    const unsubscribe = save.subscribe(state => {
+      const [message, color] = describe(state);
+      text.setText(message).setColor(color);
+      // settled saves never change again
+      if (state.status === 'saved' || state.status === 'failed') {
+        this.tweens.add({ targets: text, alpha: 0, delay: state.status === 'saved' ? 3000 : 8000, duration: 500 });
+      }
+    });
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, unsubscribe);
+  }
+
   // freeze the whole scene (physics, clock, tweens, updates) under the pause screen
   private pause(): void {
     // already paused, or nothing left to pause
     if (this.isGameOver || !this.scene.isActive()) return;
     // a finger lifted while paused never reaches this scene
     this.touch.release();
+    this.scoreSystem.flush();
     this.sound.pauseAll();
     void this.leaderboardRun?.pause().catch(() => { /* resume retries an unconfirmed pause */ });
     this.scene.pause();
@@ -314,10 +341,13 @@ export default class GameScene extends Phaser.Scene {
     this.laser.update(x, nose, underside ?? 0, underside !== undefined);
     if (!this.laser.isOn) return;
 
-    this.enemySpawner.getGroup().getMatching('active', true).forEach((enemy) => {
-      const ship = enemy as EnemyShip;
-      if (this.laser.overlaps(ship.body as Phaser.Physics.Arcade.Body)) this.destroyEnemy(ship);
-    });
+    // runs every frame, so walk the pool directly instead of allocating a filtered copy. Killed ships
+    // are only disabled and stay in the pool, and nothing spawns here, so the array doesn't change
+    const enemies = this.enemySpawner.getGroup().getChildren();
+    for (let i = 0; i < enemies.length; i++) {
+      const ship = enemies[i] as EnemyShip;
+      if (ship.active && this.laser.overlaps(ship.body as Phaser.Physics.Arcade.Body)) this.destroyEnemy(ship);
+    }
 
     if (underside === undefined || this.time.now < this.nextLaserTickAt) return;
     this.nextLaserTickAt = this.time.now + constants.laserBossTickMs;
@@ -412,6 +442,7 @@ export default class GameScene extends Phaser.Scene {
     // overlap callbacks can fire repeatedly in the same frame
     if (this.isGameOver) return;
     this.isGameOver = true;
+    this.scoreSystem.flush();
 
     // freeze the action: physics, plus the clock driving spawns, firing and score
     this.physics.pause();

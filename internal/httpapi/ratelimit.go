@@ -78,7 +78,7 @@ func NewRateLimiter(config RateConfig) (*RateLimiter, error) {
 		return nil, err
 	}
 	ttl := 10 * time.Minute
-	for _, rule := range []RateRule{config.Start, config.Finish, config.Leaderboard} {
+	for _, rule := range []RateRule{config.Start, config.Checkpoint, config.Finish, config.Leaderboard} {
 		// Eviction must not refill a bucket sooner than normal token accrual.
 		ttl = max(ttl, time.Duration(float64(rule.Burst)/float64(rule.PerMinute)*float64(time.Minute)))
 	}

@@ -5,6 +5,8 @@ import {
   LeaderboardError,
   LeaderboardRun,
   PlayerNameError,
+  pendingScoreSaves,
+  saveScore,
   validatePlayerName,
 } from '../src/leaderboard/client.ts';
 
@@ -522,4 +524,70 @@ test('an unconfirmed pause is retried before resuming, while permanent failures 
   await assert.rejects(run.resume());
   assert.equal(lost, 1);
   assert.equal(run.lostError.status, 422);
+});
+
+test('restarting during a delayed score save keeps the save going with the same credentials', async t => {
+  const calls = [];
+  let respond;
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    calls.push({ url, options });
+    await new Promise(resolve => { respond = resolve; });
+    return json(result);
+  });
+  const run = new LeaderboardRun(new LeaderboardClient(''), session, () => 1, fast);
+  const save = saveScore(run, 1000);
+  const shown = [];
+  const unsubscribe = save.subscribe(state => shown.push(state.status));
+  await delay(10);
+  // the game-over scene shuts down: it unsubscribes and the old run is stopped
+  unsubscribe();
+  run.stop();
+  assert.equal(saveScore(run, 1000), save, 'a run has one save');
+  assert.deepEqual(pendingScoreSaves(), [save]);
+  respond();
+  assert.equal((await save.done).status, 'saved');
+  assert.deepEqual(shown, ['saving']);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.signal.aborted, false);
+  assert.equal(calls[0].options.headers.Authorization, `Bearer ${session.session_token}`);
+  assert.deepEqual(JSON.parse(calls[0].options.body), { score: 1000 });
+  assert.deepEqual(pendingScoreSaves(), []);
+});
+
+test('a score save outlives its retries and keeps sending the same immutable score', async t => {
+  const calls = [];
+  let failures = 6; // more than one round of finish attempts
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    calls.push(options);
+    if (failures-- > 0) return json({ error: 'slow down' }, 429, { 'Retry-After': '0' });
+    return json(result);
+  });
+  const run = new LeaderboardRun(new LeaderboardClient(''), session, () => 1, { ...fast, finishAttempts: 2 });
+  const save = saveScore(run, 1000, { retryDelayMs: 1, maxRetryDelayMs: 2 });
+  const shown = [];
+  save.subscribe(state => shown.push(state.status))();
+  // a later scene subscribes again
+  const later = [];
+  save.subscribe(state => later.push(state.status));
+  assert.equal((await save.done).status, 'saved');
+  assert.equal(calls.length, 7);
+  for (const options of calls) {
+    assert.equal(options.headers.Authorization, `Bearer ${session.session_token}`);
+    assert.equal(options.body, JSON.stringify({ score: 1000 }));
+  }
+  assert.deepEqual(shown, ['saving']);
+  assert.ok(later.includes('retrying'));
+  assert.equal(later.at(-1), 'saved');
+});
+
+test('a score save stops when the backend definitively refuses it', async t => {
+  const fetch = t.mock.method(globalThis, 'fetch', async () => json({ error: 'run rejected' }, 422));
+  const run = new LeaderboardRun(new LeaderboardClient(''), { ...session, session_id: 'rejected-run' }, () => 1, fast);
+  const save = saveScore(run, 1000, { retryDelayMs: 1 });
+  const state = await save.done;
+  assert.equal(state.status, 'failed');
+  assert.equal(state.error.status, 422);
+  await delay(20);
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.deepEqual(pendingScoreSaves(), []);
 });

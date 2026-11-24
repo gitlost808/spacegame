@@ -363,3 +363,108 @@ export class LeaderboardRun {
     this.onLost?.(error);
   }
 }
+
+export type ScoreSaveState =
+  | { status: 'saving' }
+  // a temporary failure; another attempt follows automatically
+  | { status: 'retrying'; error: LeaderboardError }
+  | { status: 'saved'; result: RunResult }
+  | { status: 'failed'; error: LeaderboardError };
+
+export interface ScoreSaveOptions {
+  // pause between rounds of finish attempts once a round fails temporarily; doubles up to the max
+  retryDelayMs?: number;
+  maxRetryDelayMs?: number;
+}
+
+// Finalizes one run independently of any scene, so restarting the game during a slow or retrying
+// save never abandons the result. The run keeps its session credentials and immutable final score;
+// temporary failures are retried until the backend accepts or definitively refuses the score, which
+// it does at the latest once the session has expired.
+export class ScoreSave {
+  readonly run: LeaderboardRun;
+  readonly score: number;
+  private current: ScoreSaveState = { status: 'saving' };
+  private readonly listeners = new Set<(state: ScoreSaveState) => void>();
+  private readonly retryDelayMs: number;
+  private readonly maxRetryDelayMs: number;
+  private wake?: () => void;
+  private readonly settled: Promise<ScoreSaveState>;
+
+  constructor(run: LeaderboardRun, score: number, { retryDelayMs = 5000, maxRetryDelayMs = 60_000 }: ScoreSaveOptions = {}) {
+    this.run = run;
+    this.score = score;
+    this.retryDelayMs = retryDelayMs;
+    this.maxRetryDelayMs = maxRetryDelayMs;
+    this.settled = this.loop();
+  }
+
+  get state(): ScoreSaveState {
+    return this.current;
+  }
+
+  get done(): Promise<ScoreSaveState> {
+    return this.settled;
+  }
+
+  // Calls the listener now and on every change; the returned function unsubscribes, e.g. when the
+  // screen showing the status shuts down. Unsubscribing never cancels the save.
+  subscribe(listener: (state: ScoreSaveState) => void): () => void {
+    this.listeners.add(listener);
+    listener(this.current);
+    return () => { this.listeners.delete(listener); };
+  }
+
+  // skip the wait before the next automatic attempt
+  retryNow(): void {
+    this.wake?.();
+  }
+
+  private set(state: ScoreSaveState): void {
+    this.current = state;
+    for (const listener of [...this.listeners]) listener(state);
+  }
+
+  private async loop(): Promise<ScoreSaveState> {
+    for (let round = 0; ; round++) {
+      if (this.current.status !== 'saving') this.set({ status: 'saving' });
+      try {
+        // no abort signal: the save outlives the scene that started it
+        const result = await this.run.finish(this.score);
+        this.set({ status: 'saved', result });
+        return this.current;
+      } catch (caught) {
+        const error = caught instanceof LeaderboardError ? caught : new LeaderboardError(errorMessage(0));
+        if (!error.retryable || this.run.lostError) {
+          this.set({ status: 'failed', error });
+          return this.current;
+        }
+        this.set({ status: 'retrying', error });
+        const delay = Math.max(error.retryAfterMs ?? 0, Math.min(this.retryDelayMs * 2 ** round, this.maxRetryDelayMs));
+        await new Promise<void>(resolve => {
+          const timer = setTimeout(resolve, delay);
+          this.wake = () => { clearTimeout(timer); resolve(); };
+        });
+        this.wake = undefined;
+      }
+    }
+  }
+}
+
+// Saves outlive the scenes that start them; one per run, keyed by session.
+const scoreSaves = new Map<string, ScoreSave>();
+
+export function saveScore(run: LeaderboardRun, score: number, options?: ScoreSaveOptions): ScoreSave {
+  const id = run.session.session_id;
+  const existing = scoreSaves.get(id);
+  if (existing) return existing;
+  const save = new ScoreSave(run, score, options);
+  scoreSaves.set(id, save);
+  // keep finished saves out of the pending list; they stay reachable through their own reference
+  void save.done.then(() => { if (scoreSaves.get(id) === save) scoreSaves.delete(id); });
+  return save;
+}
+
+export function pendingScoreSaves(): ScoreSave[] {
+  return [...scoreSaves.values()];
+}

@@ -3,6 +3,9 @@ package maintenance
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,8 +36,8 @@ func TestCleanupBatchesAndRetention(t *testing.T) {
 			return 1, nil
 		},
 	}}
-	if deleted, err := cleaner.Sweep(context.Background(), now); err != nil || deleted != 3 || calls != 2 {
-		t.Fatalf("deleted=%d calls=%d error=%v", deleted, calls, err)
+	if deleted, saturated, err := cleaner.Sweep(context.Background(), now); err != nil || deleted != 3 || calls != 2 || saturated {
+		t.Fatalf("deleted=%d calls=%d saturated=%v error=%v", deleted, calls, saturated, err)
 	}
 }
 
@@ -43,8 +46,8 @@ func TestCleanupBudgetAndPartialFailure(t *testing.T) {
 	cleaner := Cleaner{Config: CleanupConfig{BatchSize: 2}, Queries: cleanupStore{
 		call: func(store.DeleteExpiredSessionsParams) (int64, error) { calls++; return 2, nil },
 	}}
-	if deleted, err := cleaner.Sweep(context.Background(), time.Now()); err != nil || deleted != 20 || calls != 10 {
-		t.Fatalf("sweep must be bounded: deleted=%d calls=%d error=%v", deleted, calls, err)
+	if deleted, saturated, err := cleaner.Sweep(context.Background(), time.Now()); err != nil || deleted != 20 || calls != 10 || !saturated {
+		t.Fatalf("sweep must be bounded and report saturation: deleted=%d calls=%d saturated=%v error=%v", deleted, calls, saturated, err)
 	}
 	calls = 0
 	want := errors.New("database unavailable")
@@ -55,8 +58,58 @@ func TestCleanupBudgetAndPartialFailure(t *testing.T) {
 		}
 		return 0, want
 	}}
-	if deleted, err := cleaner.Sweep(context.Background(), time.Now()); deleted != 2 || !errors.Is(err, want) {
+	if deleted, _, err := cleaner.Sweep(context.Background(), time.Now()); deleted != 2 || !errors.Is(err, want) {
 		t.Fatalf("partial sweep: deleted=%d error=%v", deleted, err)
+	}
+}
+
+func TestRunDrainsBacklogBeyondOneSweep(t *testing.T) {
+	const backlog = 55 // more than one sweep of ten batches of two
+	var mu sync.Mutex
+	remaining := int64(backlog)
+	results := make(chan bool, 10)
+	cleaner := Cleaner{
+		Config:     CleanupConfig{Interval: time.Hour, BatchSize: 2},
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DrainDelay: time.Millisecond,
+		Queries: cleanupStore{call: func(p store.DeleteExpiredSessionsParams) (int64, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			n := min(remaining, int64(p.BatchSize))
+			remaining -= n
+			return n, nil
+		}},
+		Observe: func(_ int64, saturated bool, err error) {
+			if err != nil {
+				t.Errorf("unexpected cleanup error: %v", err)
+			}
+			results <- saturated
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { cleaner.Run(ctx); close(done) }()
+	want := []bool{true, true, false} // 20 + 20 + 15 rows, without waiting an hour
+	for i, saturated := range want {
+		select {
+		case got := <-results:
+			if got != saturated {
+				t.Fatalf("sweep %d saturated=%v, want %v", i, got, saturated)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("sweep %d did not run; saturated sweeps must schedule follow-ups", i)
+		}
+	}
+	select {
+	case <-results:
+		t.Fatal("an unsaturated sweep must wait for the next interval")
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	<-done
+	if remaining != 0 {
+		t.Fatalf("%d expired sessions left behind", remaining)
 	}
 }
 

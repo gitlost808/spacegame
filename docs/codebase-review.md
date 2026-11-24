@@ -1,11 +1,15 @@
 # Codebase improvement review
 
 Recorded on 2026-11-25 from the codebase review performed on 2026-11-24.
-These are proposed changes; none have been implemented as part of this review.
+These were proposed changes. All seven have since been addressed; each section
+notes its status.
 Prioritize the first three before performance tuning. Performance benefits still
 need measurement on representative devices.
 
 ## 1. Expose retry headers to cross-origin clients
+
+**Status:** Done. CORS exposes `Retry-After` and `X-Request-ID`; covered by
+`TestCORSRequests`.
 
 **Priority:** Medium — correctness for separately hosted frontends.
 
@@ -23,6 +27,12 @@ Add coverage for an allowed cross-origin response and its exposed headers.
 
 ## 2. Preserve pending score saves across restarts
 
+**Status:** Done. `ScoreSave` in `web/src/leaderboard/client.ts` finalizes each run
+independently of the scene and retries temporary failures with backoff until
+the score is saved or refused. The game-over screen and the next run's HUD only
+display its status. Covered by tests for a delayed save during restart, retries
+beyond one round of attempts, and definitive refusal.
+
 **Priority:** Medium — potential loss of a completed run's leaderboard result.
 
 **Location:** [`web/src/ui/GameOverOverlay.ts`](../web/src/ui/GameOverOverlay.ts).
@@ -39,6 +49,9 @@ a delayed or retrying save.
 
 ## 3. Include checkpoint limits in client eviction timing
 
+**Status:** Done. Retention includes the checkpoint bucket; covered by
+`TestIdleEvictionDoesNotRefillCheckpointEarly`.
+
 **Priority:** Medium — correctness under custom rate-limit settings.
 
 **Location:** [`internal/httpapi/ratelimit.go`](../internal/httpapi/ratelimit.go).
@@ -53,6 +66,11 @@ calculation. Test a checkpoint configuration whose full refill takes longer
 than ten minutes, checking that idle eviction cannot restore tokens early.
 
 ## 4. Detect and drain expired-session cleanup backlogs
+
+**Status:** Done. A sweep that reaches its batch cap schedules another bounded
+sweep one second later. `spacegame_cleanup_backlog` and
+`spacegame_cleanup_saturated_sweeps_total` expose saturation. Covered by
+`TestRunDrainsBacklogBeyondOneSweep`; PostgreSQL behavior is unchanged.
 
 **Priority:** Medium — capacity under sustained abandoned-session traffic.
 
@@ -72,6 +90,10 @@ with more expired rows than a single sweep can process.
 
 ## 5. Reduce synchronous high-score storage writes
 
+**Status:** Done. Persistence is debounced to two seconds and flushed on pause,
+game over, scene shutdown, `pagehide`, and hidden visibility. Frame timing was
+not measured.
+
 **Priority:** Low — potential reduction in gameplay frame stalls.
 
 **Location:** [`web/src/systems/ScoreSystem.ts`](../web/src/systems/ScoreSystem.ts).
@@ -88,6 +110,10 @@ closes before a scheduled write.
 
 ## 6. Avoid temporary arrays in per-frame laser updates
 
+**Status:** Done. `updateLaser` walks the pool directly; ships are only disabled
+when killed, so the array is stable during iteration. Other call sites are
+unchanged. Allocations were not profiled.
+
 **Priority:** Low — small allocation optimization, subject to profiling.
 
 **Location:** [`web/src/GameScene.ts`](../web/src/GameScene.ts), `updateLaser`.
@@ -101,6 +127,10 @@ iteration remains safe. Profile allocations and mobile frame times before
 expanding this pattern to less frequent operations.
 
 ## 7. Offer a rendering quality limit for dense displays
+
+**Status:** Done. An opt-in battery-saver setting on the pause screen caps
+density at 1.5; native resolution stays the default. GPU savings and visual
+checks on real devices are still outstanding.
 
 **Priority:** Low — potential GPU savings on constrained devices.
 
