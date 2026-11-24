@@ -298,6 +298,9 @@ func TestCORSRequests(t *testing.T) {
 			if w.Header().Get("Access-Control-Allow-Credentials") != "" {
 				t.Fatal("CORS must not enable cookie credentials")
 			}
+			if exposed := w.Header().Get("Access-Control-Expose-Headers"); tt.allowed != "" && (!strings.Contains(exposed, "Retry-After") || !strings.Contains(exposed, "X-Request-Id")) {
+				t.Fatalf("cross-origin clients must be able to read retry and request ID headers: %q", exposed)
+			}
 		})
 	}
 }

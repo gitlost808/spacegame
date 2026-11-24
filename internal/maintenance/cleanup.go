@@ -32,53 +32,81 @@ func (c CleanupConfig) Validate() error {
 	return nil
 }
 
+// sweepBatches bounds the database work done by one sweep.
+const sweepBatches = 10
+
+// defaultDrainDelay separates follow-up sweeps while a backlog is drained.
+const defaultDrainDelay = time.Second
+
 type Cleaner struct {
 	Queries store.Querier
 	Config  CleanupConfig
 	Logger  *slog.Logger
-	Observe func(deleted int64, err error)
+	// Observe receives each sweep's result. Saturated reports that the sweep
+	// reached its batch cap, so more expired sessions are likely waiting.
+	Observe func(deleted int64, saturated bool, err error)
+	// DrainDelay is the pause before a follow-up sweep after a saturated one.
+	DrainDelay time.Duration
 }
 
-// Sweep removes at most ten batches of expired, unfinished sessions.
-func (c Cleaner) Sweep(ctx context.Context, now time.Time) (int64, error) {
-	var total int64
-	for range 10 {
+// Sweep removes at most ten batches of expired, unfinished sessions. It reports
+// saturated when every batch was full and the backlog may not be empty.
+func (c Cleaner) Sweep(ctx context.Context, now time.Time) (total int64, saturated bool, err error) {
+	for range sweepBatches {
 		deleted, err := c.Queries.DeleteExpiredSessions(ctx, store.DeleteExpiredSessionsParams{
 			Cutoff: now.Add(-c.Config.Retention), BatchSize: c.Config.BatchSize,
 		})
 		total += deleted
 		if err != nil {
-			return total, err
+			return total, false, err
 		}
 		if deleted < int64(c.Config.BatchSize) {
-			return total, nil
+			return total, false, nil
 		}
 	}
-	return total, nil
+	return total, true, nil
 }
 
+// Run sweeps immediately and then every interval. When a sweep reaches its
+// batch cap, further bounded sweeps follow after DrainDelay until the backlog
+// is drained, so sustained abandoned-session traffic cannot outgrow cleanup.
 func (c Cleaner) Run(ctx context.Context) {
 	ticker := time.NewTicker(c.Config.Interval)
 	defer ticker.Stop()
+	drainDelay := c.DrainDelay
+	if drainDelay <= 0 {
+		drainDelay = defaultDrainDelay
+	}
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		sweepCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		deleted, err := c.Sweep(sweepCtx, time.Now().UTC())
+		deleted, saturated, err := c.Sweep(sweepCtx, time.Now().UTC())
 		cancel()
 		if c.Observe != nil {
-			c.Observe(deleted, err)
+			c.Observe(deleted, saturated, err)
 		}
 		if err != nil && ctx.Err() == nil {
 			c.Logger.Error("expired session cleanup failed", "error", err)
 		} else if deleted > 0 {
-			c.Logger.Info("expired sessions deleted", "count", deleted)
+			c.Logger.Info("expired sessions deleted", "count", deleted, "backlog", saturated)
 		}
-		select {
-		case <-ctx.Done():
+		if !c.wait(ctx, ticker.C, saturated, drainDelay) {
 			return
-		case <-ticker.C:
 		}
+	}
+}
+
+// wait blocks until the next sweep is due and reports false on cancellation.
+func (c Cleaner) wait(ctx context.Context, tick <-chan time.Time, saturated bool, drainDelay time.Duration) bool {
+	if saturated {
+		tick = time.After(drainDelay)
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-tick:
+		return true
 	}
 }

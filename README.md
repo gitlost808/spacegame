@@ -211,7 +211,8 @@ JSON and Authorization preflights are supported by
 [gin-contrib/cors](https://github.com/gin-contrib/cors). Without configured
 origins, the browser frontend must use the same origin as the API. Unlisted
 cross-origin requests and preflights return HTTP 403. `*` allows any origin
-without enabling cookie credentials.
+without enabling cookie credentials. Allowed origins can read the `Retry-After`
+and `X-Request-ID` response headers.
 
 Per-client request limits default to starts 30/minute (burst 10), finishes
 120/minute (burst 20), and leaderboard reads 300/minute (burst 30). A global

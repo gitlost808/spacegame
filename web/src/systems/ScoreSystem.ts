@@ -20,6 +20,10 @@ function saveHighScore(value: number): void {
   }
 }
 
+// Synchronous storage writes can stall a frame, and once a player beats their record every point
+// raises it; batch the writes and flush when the run pauses, ends or the page goes away.
+const persistDelayMs = 2000;
+
 export class ScoreSystem {
   private scene: Phaser.Scene;
   private scoreText: Phaser.GameObjects.Text;
@@ -27,11 +31,14 @@ export class ScoreSystem {
 
   private score = 0;
   private highScore = 0;
+  private persistedHighScore = 0;
+  private persistTimer?: ReturnType<typeof setTimeout>;
 
   constructor(scene: Phaser.Scene) {
     this.scene = scene;
 
     this.highScore = Math.max(loadHighScore(), scene.registry.get('highScore') ?? 0);
+    this.persistedHighScore = this.highScore;
 
     this.scoreText = scene.add.text(10, 10, 'Score: 0', {
       fontSize: '20px',
@@ -52,6 +59,25 @@ export class ScoreSystem {
       callback: this.incrementScore,
       callbackScope: this,
     });
+
+    const onPageHidden = () => { if (document.visibilityState === 'hidden') this.flush(); };
+    const flush = () => this.flush();
+    document.addEventListener('visibilitychange', onPageHidden);
+    window.addEventListener('pagehide', flush);
+    scene.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+      document.removeEventListener('visibilitychange', onPageHidden);
+      window.removeEventListener('pagehide', flush);
+      this.flush();
+    });
+  }
+
+  // write a pending personal best now, e.g. on pause or game over
+  public flush(): void {
+    clearTimeout(this.persistTimer);
+    this.persistTimer = undefined;
+    if (this.highScore <= this.persistedHighScore) return;
+    saveHighScore(this.highScore);
+    this.persistedHighScore = this.highScore;
   }
 
   private incrementScore(): void {
@@ -71,7 +97,7 @@ export class ScoreSystem {
       this.highScore = this.score;
       this.scene.registry.set('highScore', this.highScore);
       this.highScoreText.setText(`High Score: ${this.highScore}`);
-      saveHighScore(this.highScore);
+      this.persistTimer ??= setTimeout(() => this.flush(), persistDelayMs);
     }
   }
 

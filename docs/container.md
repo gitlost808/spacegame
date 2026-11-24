@@ -156,13 +156,15 @@ word-list attribution and licensing at
 `/usr/share/licenses/spacegame-backend/namefilter/`.
 
 Client limits group each IPv4 address or IPv6 /64. HTTP 429 includes
-`Retry-After`. State is bounded, held in memory, reset on restart, and local to
-each instance. Configure a shared budget at ingress when running replicas.
+`Retry-After`; CORS exposes it and `X-Request-ID` to allowed origins. State is
+bounded, held in memory, reset on restart, and local to each instance. Configure a shared budget at ingress when running replicas.
 
 Each server runs cleanup immediately and every configured interval. It deletes
 unfinished sessions after their expiry plus the retention period and preserves
 completed scores. A sweep processes at most ten batches within 30 seconds and
-skips locked rows, allowing multiple replicas to clean up concurrently. An
+skips locked rows, allowing multiple replicas to clean up concurrently. When a
+sweep reaches that cap, another bounded sweep follows one second later instead
+of waiting for the interval, until the backlog is drained. An
 authenticated finish rejected for an invalid score, too-short duration, or
 expiry immediately deletes the unfinished session; later attempts return 404.
 Wrong tokens cannot delete sessions, and completed scores are preserved.
@@ -183,9 +185,13 @@ all API requests.
 | `spacegame_expired_sessions_deleted_total` | Removed unfinished sessions |
 | `spacegame_cleanup_last_success_timestamp_seconds` | Last successful cleanup sweep, including empty sweeps |
 | `spacegame_cleanup_errors_total` | Failed cleanup sweeps |
+| `spacegame_cleanup_backlog` | One when the last successful sweep reached its batch cap |
+| `spacegame_cleanup_saturated_sweeps_total` | Sweeps that reached their batch cap |
 
 Go runtime and process metrics are also exposed. Poll `/readyz` regularly to
 keep the readiness gauge current; scraping metrics does not run the readiness
 check. Configure scrape failures, readiness failures, error rates, latency, and
 stalled cleanup alerts in the infrastructure repository. A cleanup staleness
-threshold must allow for its configured interval and execution time.
+threshold must allow for its configured interval and execution time. A backlog
+gauge that stays at one indicates expired sessions arriving faster than cleanup
+can remove them.

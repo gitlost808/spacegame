@@ -35,7 +35,9 @@ func NewHandler(logger *slog.Logger, db ReadinessChecker, config Config) (*gin.E
 	corsConfig := cors.Config{
 		AllowMethods: []string{http.MethodGet, http.MethodPost, http.MethodOptions},
 		AllowHeaders: []string{"Authorization", "Content-Type"},
-		MaxAge:       10 * time.Minute,
+		// Browsers hide non-safelisted response headers from cross-origin scripts.
+		ExposeHeaders: []string{"Retry-After", "X-Request-ID"},
+		MaxAge:        10 * time.Minute,
 	}
 	for _, origin := range config.AllowedOrigins {
 		if origin = strings.TrimSpace(origin); origin != "" {

@@ -173,3 +173,30 @@ func TestRateConfigFromEnv(t *testing.T) {
 		})
 	}
 }
+
+func TestIdleEvictionDoesNotRefillCheckpointEarly(t *testing.T) {
+	c := DefaultRateConfig()
+	c.Checkpoint = RateRule{PerMinute: 1, Burst: 30} // a full refill takes 30 minutes
+	c.GlobalPerSecond, c.GlobalBurst = 1000, 1000
+	l, err := NewRateLimiter(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	l.now = func() time.Time { return now }
+	for range 30 {
+		if l.allow("a", "checkpoint") != 0 {
+			t.Fatal("checkpoint burst must be available")
+		}
+	}
+	now = now.Add(11 * time.Minute)
+	allowed := 0
+	for range 30 {
+		if l.allow("a", "checkpoint") == 0 {
+			allowed++
+		}
+	}
+	if allowed != 11 {
+		t.Fatalf("after 11 idle minutes allowed %d checkpoints, want 11 refilled tokens", allowed)
+	}
+}

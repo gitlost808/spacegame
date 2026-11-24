@@ -24,6 +24,12 @@ then resize and switch pixel density in both directions. Check title, pause,
 and game-over text, pointer alignment, ship collision sizes, and projectile sizes
 after pool reuse. Check formation spacing and where the laser stops on the boss.
 
+Native resolution is the default. On the pause screen, **GRAPHICS** (or **G**)
+switches to *battery saver*, which caps the drawing buffer at 1.5 device pixels
+per CSS pixel (a quarter of the pixels at DPR 3) for constrained devices. The
+choice is stored on the device and applies immediately; the GPU and frame-time
+savings have not been measured yet.
+
 ## Persistent leaderboard
 
 The game uses the [backend](../README.md) in this repository
@@ -31,14 +37,19 @@ for shared scores. Before each run, choose a pilot name (1–32 characters); the
 browser remembers it for next time. A session is created before gameplay starts,
 the running score is checkpointed every 10 seconds while playing, and game
 over submits the final score with that run's private token. Tokens stay in
-memory. The existing personal high score remains in browser storage.
+memory. The existing personal high score remains in browser storage; while it
+rises it is written at most every two seconds, and immediately on pause, game
+over, and when the page is hidden or closed.
 
 Open **LEADERBOARD** on the title or game-over screen, or press **L**, to see the
 top 20 runs. The current run is highlighted if it appears in the results. Temporary
-failures are retried automatically, and from game over once those retries run out.
-Retries send the same score and token and are idempotent on the backend. If the
-backend drops a run mid-flight, the HUD says so right away and the run doesn't
-count. Starting another run or reloading discards an unsaved submission. **Play offline** skips
+failures are retried automatically with backoff until the backend accepts or
+definitively refuses the score; **RETRY NOW** on the game-over screen skips the
+wait. Retries send the same score and token and are idempotent on the backend.
+Saving continues when the player starts another run, and the next run's HUD
+shows whether the previous score was saved. If the backend drops a run
+mid-flight, the HUD says so right away and the run doesn't count. Reloading or
+closing the page discards an unsaved submission. **Play offline** skips
 the backend and keeps the personal high score on this device.
 
 ### Local setup
@@ -105,7 +116,9 @@ The frontend follows the backend's session contract (`LeaderboardRun` in
 - At game over, stop the checkpoints, wait for one still in flight, then
   `POST /sessions/:id/finish` with the final score, which is at least the last
   checkpoint. Temporary failures are retried with the same score, waiting for
-  `Retry-After` on 429.
+  `Retry-After` on 429. The save is not tied to the game-over screen: restarting
+  keeps it running until it succeeds or the backend refuses it (at the latest
+  when the session expires).
 - `422 run rejected` (the run was deleted), 404 (gone) and 401 (bad token) end
   the run: nothing more is sent and the player is told it doesn't count. A 409 on
   a checkpoint means the run is already finished, so the checkpoints stop.

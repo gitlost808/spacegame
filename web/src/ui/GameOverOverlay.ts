@@ -1,6 +1,6 @@
 import Phaser from 'phaser';
 import { constants } from '../constants';
-import { LeaderboardError, LeaderboardRun } from '../leaderboard/client';
+import { LeaderboardRun, ScoreSaveState, saveScore } from '../leaderboard/client';
 import { openLeaderboardDialog } from '../leaderboard/dialogs';
 
 const toHex = (color: number) => `#${color.toString(16).padStart(6, '0')}`;
@@ -13,8 +13,6 @@ export class GameOverOverlay extends Phaser.GameObjects.Container {
   private prompt: Phaser.GameObjects.Text;
   private saveStatus: Phaser.GameObjects.Text;
   private retryButton: Phaser.GameObjects.Text;
-  private readonly saveController = new AbortController();
-  private saving = false;
 
   private readyAt: number;
   private restarting = false;
@@ -62,7 +60,7 @@ export class GameOverOverlay extends Phaser.GameObjects.Container {
       align: 'center',
       wordWrap: { width: constants.width - 70 },
     }).setOrigin(0.5);
-    this.retryButton = scene.add.text(0, 0, 'RETRY SAVE', {
+    this.retryButton = scene.add.text(0, 0, 'RETRY NOW', {
       fontSize: '16px', color: '#859900',
     }).setOrigin(0.5).setPadding(10).setInteractive({ useHandCursor: true }).setVisible(false);
     const leaderboardButton = scene.add.text(0, 0, 'LEADERBOARD (L)', {
@@ -125,28 +123,32 @@ export class GameOverOverlay extends Phaser.GameObjects.Container {
       }
     );
 
-    // One immutable result per run; the run retries temporary failures itself, and the retry
-    // button sends the same score again, as required by the API.
-    const save = async () => {
-      if (!run || this.saving || this.saveController.signal.aborted) return;
-      this.saving = true;
-      this.retryButton.setVisible(false);
-      this.saveStatus.setText('Saving score…');
-      try {
-        await run.finish(score, this.saveController.signal);
-        if (!this.saveController.signal.aborted) this.saveStatus.setText('Score saved to leaderboard');
-      } catch (error) {
-        if (this.saveController.signal.aborted) return;
-        this.saveStatus.setText(error.message);
-        this.retryButton.setVisible(error instanceof LeaderboardError && error.retryable);
-      } finally {
-        this.saving = false;
-      }
-    };
-    this.retryButton.on('pointerdown', save);
-    scene.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this.saveController.abort());
-    if (run) void save();
-    else this.saveStatus.setText('Offline run • personal best kept on this device');
+    // One immutable result per run. The save lives outside this scene, so restarting while it is
+    // pending or retrying keeps it going; the next run shows its status instead.
+    if (run) {
+      const save = saveScore(run, score);
+      this.retryButton.on('pointerdown', () => save.retryNow());
+      const unsubscribe = save.subscribe(state => this.showSave(state));
+      scene.events.once(Phaser.Scenes.Events.SHUTDOWN, unsubscribe);
+    } else this.saveStatus.setText('Offline run • personal best kept on this device');
+  }
+
+  private showSave(state: ScoreSaveState): void {
+    switch (state.status) {
+      case 'saving':
+        this.saveStatus.setText('Saving score…');
+        break;
+      case 'retrying':
+        this.saveStatus.setText(`${state.error.message}\nRetrying automatically, also after a restart.`);
+        break;
+      case 'saved':
+        this.saveStatus.setText('Score saved to leaderboard');
+        break;
+      case 'failed':
+        this.saveStatus.setText(state.error.message);
+        break;
+    }
+    this.retryButton.setVisible(state.status === 'retrying');
   }
 
   // cover the whole window, not just the playfield, so the bars around it on tall or wide screens
