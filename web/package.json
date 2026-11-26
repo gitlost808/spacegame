@@ -19,7 +19,7 @@
     "clean": "rm -rf dist .parcel-cache",
     "build": "parcel build",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.worker.json",
-    "test": "node --test tests/leaderboard.test.mjs"
+    "test": "node --test tests/leaderboard.test.mjs tests/variation.test.mjs"
   },
   "source": "src/index.pug"
 }

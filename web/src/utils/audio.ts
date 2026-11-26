@@ -1,7 +1,8 @@
 import Phaser from 'phaser';
 import { constants } from '../constants';
-import { synthesize } from './synth';
-import { sounds, SoundKey } from './sounds';
+import { synthesize, SoundLayer } from './synth';
+import { sounds, soundVariants, variantSpread, SoundKey } from './sounds';
+import { pickVariant, seededRng, varyLayers } from './variation';
 import { RenderedTrack, trackKeys, TrackKey } from '../music';
 
 const mutedKey = 'galactic-skirmish:muted';
@@ -14,12 +15,31 @@ export function generateAllSounds(scene: Phaser.Scene): void {
   if (!(scene.sound instanceof Phaser.Sound.WebAudioSoundManager)) return;
   const context = scene.sound.context;
 
-  for (const [key, layers] of Object.entries(sounds)) {
-    const samples = synthesize(layers, context.sampleRate);
+  const add = (key: string, layers: SoundLayer[], rng?: () => number) => {
+    const samples = synthesize(layers, context.sampleRate, rng);
     const buffer = context.createBuffer(1, samples.length, context.sampleRate);
     buffer.copyToChannel(samples, 0);
     scene.cache.audio.add(key, buffer);
+  };
+
+  for (const [key, layers] of Object.entries(sounds) as [SoundKey, SoundLayer[]][]) {
+    const count = soundVariants[key] ?? 1;
+    if (count === 1) {
+      add(key, layers);
+      continue;
+    }
+    // seeded per key, so the variants (and their noise) are the same on every boot
+    const rng = seededRng(hashKey(key));
+    for (let i = 0; i < count; i++) add(variantKey(key, i), i === 0 ? layers : varyLayers(layers, rng, variantSpread), rng);
   }
+}
+
+const variantKey = (key: string, index: number) => `${key}:${index}`;
+
+function hashKey(key: string): number {
+  let hash = 2166136261;
+  for (let i = 0; i < key.length; i++) hash = Math.imul(hash ^ key.charCodeAt(i), 16777619);
+  return hash >>> 0;
 }
 
 // the track that should be playing (none between runs), so it can start as soon as it's rendered
@@ -114,16 +134,24 @@ function silence(scene: Phaser.Scene, track: TrackKey, windDown: boolean): void 
 }
 
 const lastPlayedAt = new Map<SoundKey, number>();
+const lastVariant = new Map<SoundKey, number>();
 
 export function playSound(scene: Phaser.Scene, key: SoundKey, config: Phaser.Types.Sound.SoundConfig = {}): void {
-  if (!scene.cache.audio.exists(key)) return;
+  const variants = soundVariants[key] ?? 1;
+  // sounds with variants are cached as key:index, and never repeat the variant they just played
+  const index = pickVariant(variants, lastVariant.get(key));
+  const cacheKey = variants > 1 ? variantKey(key, index) : key;
+  if (!scene.cache.audio.exists(cacheKey)) return;
 
   // the same sound several times in one moment (bombs, spread hits) only gets louder, not better
   const now = scene.game.loop.time;
   if (now - (lastPlayedAt.get(key) ?? -Infinity) < constants.soundMinIntervalMs) return;
   lastPlayedAt.set(key, now);
+  lastVariant.set(key, index);
 
-  scene.sound.play(key, { volume: constants.soundVolume, ...config });
+  // a little random loudness on top of the variant, for the sounds that have variants
+  const loudness = variants > 1 ? 1 - Math.random() * constants.soundVolumeJitter : 1;
+  scene.sound.play(cacheKey, { volume: constants.soundVolume * loudness, ...config });
 }
 
 // a sound that repeats until its owner stops it; undefined without Web Audio

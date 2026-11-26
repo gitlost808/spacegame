@@ -14,6 +14,19 @@ export type SoundKey =
   | 'boss-warn'
   | 'game-over';
 
+// how many differently rendered versions to make of the sounds that play often; each play picks one
+// at random. Sounds not listed here are rendered once
+export const soundVariants: Partial<Record<SoundKey, number>> = {
+  shoot: 5,
+  'enemy-shoot': 4,
+  'enemy-hit': 4,
+  explosion: 6,
+  'shield-hit': 3,
+};
+
+// how far each variant's pitch sweep, length, fade and volume may drift from the recipe below
+export const variantSpread = 0.18;
+
 // every sound effect in the game, synthesized at boot
 export const sounds: Record<SoundKey, SoundLayer[]> = {
   // fired several times a second, so short and quiet
