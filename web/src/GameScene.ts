@@ -133,7 +133,7 @@ export default class GameScene extends Phaser.Scene {
         ship.despawn();
         this.effects.explode(x, y, ship.color);
         this.effects.shake(constants.shieldHitShakeMs, constants.shieldHitShakeIntensity);
-        playSound(this, 'shield-hit');
+        playSound(this, 'shield-hit', randomDetune());
         playSound(this, 'explosion', randomDetune());
         this.scoreSystem.addPoints(ship.points);
       },
@@ -148,7 +148,7 @@ export default class GameScene extends Phaser.Scene {
         const { x, y } = bullet as EnemyProjectile;
         (bullet as EnemyProjectile).disableBody(true, true);
         this.effects.explode(x, y, constants.shieldColor, constants.explosionSmallParticles);
-        playSound(this, 'shield-hit');
+        playSound(this, 'shield-hit', randomDetune());
       },
       canHitPlayer,
       this
@@ -164,7 +164,7 @@ export default class GameScene extends Phaser.Scene {
         if (ship.damage()) return this.destroyEnemy(ship);
         // survived the hit: just a few sparks
         this.effects.explode(x, y, 0xffffff, constants.enemyHitSparkParticles);
-        playSound(this, 'enemy-hit');
+        playSound(this, 'enemy-hit', randomDetune());
       },
       undefined,
       this
@@ -180,7 +180,7 @@ export default class GameScene extends Phaser.Scene {
         (proj as Projectile).disableBody(true, true);
         if (this.damageBoss()) return;
         this.effects.explode(x, y, 0xffffff, constants.enemyHitSparkParticles);
-        playSound(this, 'enemy-hit');
+        playSound(this, 'enemy-hit', randomDetune());
       },
       undefined,
       this
@@ -397,7 +397,7 @@ export default class GameScene extends Phaser.Scene {
     if (this.boss.active) this.damageBoss(this.boss.maxHp * constants.bossBombDamage);
     this.cameras.main.flash(250, 203, 75, 22);
     this.effects.shake(constants.bombShakeMs, constants.bombShakeIntensity);
-    playSound(this, 'big-explosion');
+    playSound(this, 'big-explosion', randomDetune());
   }
 
   // returns true when the boss is beaten. Nothing else drops power-ups during a boss wave, so each
@@ -430,7 +430,7 @@ export default class GameScene extends Phaser.Scene {
     }
     this.effects.explode(x, y, constants.bossColor, constants.explosionDeathParticles);
     this.effects.shake(constants.bombShakeMs, constants.bombShakeIntensity);
-    playSound(this, 'big-explosion');
+    playSound(this, 'big-explosion', randomDetune());
     playMusic(this, 'main', true);
     // always a shield: a bomb would go off on an empty screen, and a spread would run out during the
     // break. With the shield full it's worth points instead
@@ -462,7 +462,7 @@ export default class GameScene extends Phaser.Scene {
       constants.explosionDeathParticles
     );
     this.effects.shake(constants.deathShakeMs, constants.deathShakeIntensity);
-    playSound(this, 'big-explosion');
+    playSound(this, 'big-explosion', randomDetune());
     playSound(this, 'game-over');
     stopMusic(this);
 

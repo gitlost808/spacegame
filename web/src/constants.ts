@@ -309,7 +309,9 @@ export const constants = {
   soundVolume: 0.8,
   soundMinIntervalMs: 40,
   // random pitch variation for frequent sounds (cents)
-  soundDetuneCents: 80,
+  soundDetuneCents: 120,
+  // how much quieter than full a varied sound may randomly play (0.2 = down to 80%)
+  soundVolumeJitter: 0.25,
   // background music sits under the sound effects
   musicVolume: 0.5,
   // switching tracks (boss wave, boss defeated) and game over: the old track slows to this rate as it fades
