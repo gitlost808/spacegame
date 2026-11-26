@@ -369,7 +369,7 @@ export default class GameScene extends Phaser.Scene {
       ? [-constants.spreadVelocityX, 0, constants.spreadVelocityX]
       : [0];
     for (const vx of velocities) this.spawnProjectile(vx);
-    playSound(this, 'shoot', randomDetune());
+    playSound(this, 'shoot', randomDetune(constants.shootDetuneCents));
   }
 
   private spawnProjectile(vx: number): void {

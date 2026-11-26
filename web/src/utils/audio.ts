@@ -1,7 +1,7 @@
 import Phaser from 'phaser';
 import { constants } from '../constants';
 import { synthesize, SoundLayer } from './synth';
-import { sounds, soundVariants, variantSpread, SoundKey } from './sounds';
+import { sounds, variantCount, variantRecipes, variantSpread, SoundKey } from './sounds';
 import { pickVariant, seededRng, varyLayers } from './variation';
 import { RenderedTrack, trackKeys, TrackKey } from '../music';
 
@@ -23,14 +23,14 @@ export function generateAllSounds(scene: Phaser.Scene): void {
   };
 
   for (const [key, layers] of Object.entries(sounds) as [SoundKey, SoundLayer[]][]) {
-    const count = soundVariants[key] ?? 1;
+    const count = variantCount(key);
     if (count === 1) {
       add(key, layers);
       continue;
     }
     // seeded per key, so the variants (and their noise) are the same on every boot
     const rng = seededRng(hashKey(key));
-    for (let i = 0; i < count; i++) add(variantKey(key, i), i === 0 ? layers : varyLayers(layers, rng, variantSpread), rng);
+    for (let i = 0; i < count; i++) add(variantKey(key, i), variantRecipes[key]?.[i] ?? (i === 0 ? layers : varyLayers(layers, rng, variantSpread)), rng);
   }
 }
 
@@ -137,7 +137,7 @@ const lastPlayedAt = new Map<SoundKey, number>();
 const lastVariant = new Map<SoundKey, number>();
 
 export function playSound(scene: Phaser.Scene, key: SoundKey, config: Phaser.Types.Sound.SoundConfig = {}): void {
-  const variants = soundVariants[key] ?? 1;
+  const variants = variantCount(key);
   // sounds with variants are cached as key:index, and never repeat the variant they just played
   const index = pickVariant(variants, lastVariant.get(key));
   const cacheKey = variants > 1 ? variantKey(key, index) : key;
@@ -162,8 +162,8 @@ export function loopSound(scene: Phaser.Scene, key: SoundKey): Phaser.Sound.Base
 }
 
 // slight random pitch variation so repeated sounds don't feel mechanical
-export function randomDetune(): Phaser.Types.Sound.SoundConfig {
-  return { detune: Phaser.Math.Between(-constants.soundDetuneCents, constants.soundDetuneCents) };
+export function randomDetune(cents = constants.soundDetuneCents): Phaser.Types.Sound.SoundConfig {
+  return { detune: Phaser.Math.Between(-cents, cents) };
 }
 
 export const loadMuted = () => loadFlag(mutedKey);

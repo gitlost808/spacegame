@@ -17,12 +17,39 @@ export type SoundKey =
 // how many differently rendered versions to make of the sounds that play often; each play picks one
 // at random. Sounds not listed here are rendered once
 export const soundVariants: Partial<Record<SoundKey, number>> = {
-  shoot: 5,
   'enemy-shoot': 4,
   'enemy-hit': 4,
   explosion: 6,
   'shield-hit': 3,
 };
+
+// hand-written variants for sounds whose jittered copies were too alike. Each is a different take on the
+// same idea (a quick falling zap), varying the wave, the pitch contour and a click or body layer, so
+// they stay recognisably the same shot but never sound like the same sample. The first is the plain recipe
+const shootVariants: SoundLayer[][] = [
+  [{ wave: 'square', duration: 0.08, from: 1200, to: 300, volume: 0.1 }],
+  [
+    { wave: 'saw', duration: 0.09, from: 1500, to: 450, volume: 0.075, decay: 1.6 },
+    { wave: 'noise', duration: 0.025, from: 8000, to: 3000, volume: 0.05 },
+  ],
+  [
+    { wave: 'triangle', duration: 0.1, from: 1000, to: 220, volume: 0.15, decay: 1.4 },
+    { wave: 'square', duration: 0.05, from: 2000, to: 900, volume: 0.04 },
+  ],
+  [
+    { wave: 'square', duration: 0.065, from: 900, to: 500, volume: 0.09, decay: 1.2 },
+    { wave: 'sine', duration: 0.09, from: 600, to: 150, volume: 0.12 },
+  ],
+  [
+    { wave: 'saw', duration: 0.07, from: 1800, to: 700, volume: 0.07, decay: 2.5 },
+    { wave: 'square', duration: 0.1, from: 450, to: 200, volume: 0.06, decay: 1.8, attack: 0.012 },
+  ],
+];
+
+// explicit recipes by key; sounds listed here don't use soundVariants
+export const variantRecipes: Partial<Record<SoundKey, SoundLayer[][]>> = { shoot: shootVariants };
+
+export const variantCount = (key: SoundKey): number => variantRecipes[key]?.length ?? soundVariants[key] ?? 1;
 
 // how far each variant's pitch sweep, length, fade and volume may drift from the recipe below
 export const variantSpread = 0.18;
@@ -30,7 +57,7 @@ export const variantSpread = 0.18;
 // every sound effect in the game, synthesized at boot
 export const sounds: Record<SoundKey, SoundLayer[]> = {
   // fired several times a second, so short and quiet
-  shoot: [{ wave: 'square', duration: 0.08, from: 1200, to: 300, volume: 0.1 }],
+  shoot: shootVariants[0],
   'enemy-shoot': [{ wave: 'triangle', duration: 0.12, from: 520, to: 180, volume: 0.18 }],
   // a tank taking a hit without dying
   'enemy-hit': [{ wave: 'square', duration: 0.05, from: 1800, to: 1100, volume: 0.1, decay: 3 }],

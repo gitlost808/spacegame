@@ -310,6 +310,8 @@ export const constants = {
   soundMinIntervalMs: 40,
   // random pitch variation for frequent sounds (cents)
   soundDetuneCents: 120,
+  // the player's shot already varies by recipe and fires constantly, so it only drifts a little
+  shootDetuneCents: 40,
   // how much quieter than full a varied sound may randomly play (0.2 = down to 80%)
   soundVolumeJitter: 0.25,
   // background music sits under the sound effects
